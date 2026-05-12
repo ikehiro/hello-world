@@ -1,5 +1,183 @@
 # Snowflake
 
+Snowflake実接続でGitBucket CI Plugin前提の構成、池田さんの既存スタック（自己ホスト型GitBucket + Docker）に合わせて詰めていきますね。
+全体アーキテクチャ
+
+[Push/PR] → GitBucket → CI Plugin → Docker Runner
+                                      ├─ Stage1: deps解決
+                                      ├─ Stage2: dbt parse (offline)
+                                      ├─ Stage3: dbt compile (Snowflake接続)
+                                      ├─ Stage4: dbt build --select state:modified+ (CI用DB)
+                                      └─ Stage5: unit test
+
+
+Snowflake側の準備
+CI専用環境を分離するのが鉄則です。
+
+-- CI専用ロール・ウェアハウス・DB
+CREATE ROLE CI_ROLE;
+CREATE WAREHOUSE CI_WH WITH 
+  WAREHOUSE_SIZE = 'XSMALL' 
+  AUTO_SUSPEND = 60 
+  AUTO_RESUME = TRUE;
+CREATE DATABASE CI_DB;
+
+-- CI用ユーザー（key pair認証推奨）
+CREATE USER CI_USER 
+  RSA_PUBLIC_KEY='MIIBIj...'
+  DEFAULT_ROLE = CI_ROLE
+  DEFAULT_WAREHOUSE = CI_WH;
+
+GRANT ROLE CI_ROLE TO USER CI_USER;
+GRANT USAGE ON WAREHOUSE CI_WH TO ROLE CI_ROLE;
+GRANT ALL ON DATABASE CI_DB TO ROLE CI_ROLE;
+
+-- 本番からのzero-copy clone権限（state:modified+ で参照用）
+GRANT IMPORTED PRIVILEGES ON DATABASE PROD_DB TO ROLE CI_ROLE;
+
+
+ポイント: パスワード認証ではなくkey pair認証にすると、秘密鍵をGitBucketのSecretsに格納してCIから安全に使えます。
+Dockerfile (multi-stage)
+
+# ===== Stage 1: base =====
+FROM python:3.11-slim AS base
+RUN pip install --no-cache-dir uv
+WORKDIR /dbt
+
+# ===== Stage 2: deps =====
+FROM base AS deps
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev
+
+# ===== Stage 3: dbt deps =====  
+FROM deps AS dbt-deps
+COPY packages.yml dbt_project.yml ./
+RUN uv run dbt deps
+
+# ===== Stage 4: parse (オフライン構文チェック) =====
+FROM dbt-deps AS parse
+COPY . .
+RUN uv run dbt parse  # 接続不要、manifest生成
+
+# ===== Stage 5: CI実行 (Snowflake接続あり) =====
+FROM parse AS ci
+ARG SNOWFLAKE_ACCOUNT
+ARG SNOWFLAKE_USER
+ARG SNOWFLAKE_ROLE=CI_ROLE
+ARG SNOWFLAKE_WAREHOUSE=CI_WH
+ARG SNOWFLAKE_DATABASE=CI_DB
+ARG CI_SCHEMA  # PR番号などで動的に
+
+ENV DBT_PROFILES_DIR=/dbt/.ci
+COPY .ci/profiles.yml /dbt/.ci/profiles.yml
+
+# 秘密鍵はbuild時にsecret mountで注入(後述)
+RUN --mount=type=secret,id=sf_private_key,target=/tmp/key.p8 \
+    cp /tmp/key.p8 /dbt/.ci/key.p8 && chmod 600 /dbt/.ci/key.p8
+
+
+profiles.yml (CI用)
+
+# .ci/profiles.yml
+my_project:
+  target: ci
+  outputs:
+    ci:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      private_key_path: /dbt/.ci/key.p8
+      role: "{{ env_var('SNOWFLAKE_ROLE') }}"
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE') }}"
+      database: "{{ env_var('SNOWFLAKE_DATABASE') }}"
+      schema: "{{ env_var('CI_SCHEMA') }}"  # PR_123 等
+      threads: 8
+      query_tag: "ci_build_{{ env_var('CI_BUILD_ID') }}"
+
+
+GitBucket CI Plugin設定
+
+# .gitbucket/ci.yml (またはJenkinsfile風スクリプト)
+stages:
+  - name: build-and-test
+    image: docker:24
+    commands:
+      # PR番号から一意なスキーマ名を生成
+      - export CI_SCHEMA="PR_${CI_PULL_REQUEST_ID}_$(git rev-parse --short HEAD)"
+      
+      # 秘密鍵をsecretから取り出してbuild
+      - echo "$SNOWFLAKE_PRIVATE_KEY" > /tmp/key.p8
+      - |
+        docker build \
+          --target ci \
+          --build-arg SNOWFLAKE_ACCOUNT=$SNOWFLAKE_ACCOUNT \
+          --build-arg SNOWFLAKE_USER=$SNOWFLAKE_USER \
+          --build-arg CI_SCHEMA=$CI_SCHEMA \
+          --secret id=sf_private_key,src=/tmp/key.p8 \
+          -t dbt-ci:$CI_BUILD_ID .
+      
+      # 本番manifestを取得してstate比較
+      - aws s3 cp s3://dbt-artifacts/prod/manifest.json ./prod-manifest/
+      
+      # 差分のみbuild + test
+      - |
+        docker run --rm \
+          -v $(pwd)/prod-manifest:/dbt/prod-manifest \
+          dbt-ci:$CI_BUILD_ID \
+          uv run dbt build \
+            --select "state:modified+" \
+            --defer --state /dbt/prod-manifest \
+            --fail-fast
+      
+      # unit test (接続不要分は別途分離可)
+      - |
+        docker run --rm dbt-ci:$CI_BUILD_ID \
+          uv run dbt test --select "test_type:unit"
+
+  - name: cleanup
+    when: always  # 成否に関わらず実行
+    commands:
+      - |
+        docker run --rm dbt-ci:$CI_BUILD_ID \
+          uv run dbt run-operation drop_ci_schema \
+            --args "{schema: $CI_SCHEMA}"
+
+
+設計上のキーポイント
+1. PR単位のスキーマ分離
+CI_SCHEMA = PR_123_abc1234 のように動的生成し、PR間の干渉を防ぐ。マージ後 or PR closeで必ずdrop。
+2. state:modified+ + --defer
+変更されたモデルとその下流だけを実行。未変更モデルは本番(PROD_DB)を参照するので、CI時間とSnowflakeクレジットを大幅節約。本番のmanifest.jsonをS3等に保管しておくのが前提。
+3. zero-copy cloneで初期データ準備
+大規模テーブルの場合、CREATE SCHEMA CI_PR_123 CLONE PROD.SCHEMA をon-run-startフックで実行すればストレージコストほぼゼロで本番同等データでテスト可能。
+4. unit test と data test の分離
+	∙	dbt test --select "test_type:unit" → ロジック検証(seed固定値)
+	∙	dbt build 内の通常test → 実データ品質検証
+5. クリーンアップ用macro
+
+-- macros/drop_ci_schema.sql
+{% macro drop_ci_schema(schema) %}
+  {% do run_query("DROP SCHEMA IF EXISTS " ~ target.database ~ "." ~ schema ~ " CASCADE") %}
+{% endmacro %}
+
+
+GitBucket Secretsに登録するもの
+	∙	SNOWFLAKE_ACCOUNT
+	∙	SNOWFLAKE_USER (CI_USER)
+	∙	SNOWFLAKE_PRIVATE_KEY (PEM全体)
+	∙	AWS credentials (manifest取得用、IAM Roleが使えればそちら)
+想定される詰まりどころ
+GitBucket CI PluginのDocker-in-Docker: pluginの実行モードによってはDinD設定が必要。Docker socketをmountする方式の方がシンプルです。
+manifest.json管理: 本番デプロイ時に必ずS3/MinIO等にuploadする運用フローが別途必要。これがないと--deferが機能しません。
+Snowflakeクレジット監視: query_tagを仕込んでおくと、CI由来のクエリだけ集計できて費用管理が楽になります。
+ここから先、どこを深掘りしましょうか？
+	∙	本番デプロイ側のpipeline (manifest upload含む)
+	∙	on-run-startでのzero-copy clone実装
+	∙	DinD回避でDocker socket mount方式の具体手順
+	∙	pre-commit + dbt-checkpoint との組み合わせ​​​​​​​​​​​​​​​​
+
+
+
 Snowflakeの通常テーブルは、ユーザーが物理パーティションを設計する⽅式ではなく、Snowflakeが⾃動
 で「マイクロパーティション」に分割して保存する⽅式です。マイクロパーティションは、Snowflakeのストレージ
 層で管理される⼩さな連続ストレージ単位で、各パーティションには50MB〜500MBの⾮圧縮データが⼊
