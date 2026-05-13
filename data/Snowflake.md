@@ -1,8 +1,43 @@
 # Snowflake
 
+dbtのCI/CDリファレンス実装、いくつか定番がありますね。最新情報も含めて調べておきます。​​​​​​​​​​​​​​​​
+
+いくつか定番のリファレンス実装が見つかりました。池田さんの状況（GitBucket + Docker + Snowflake想定）に照らして、用途別に整理しますね。
+最もおすすめの3つ
+1. bruno-szdl/dbt-ci-cd (Snowflake特化、最も実装に近い)
+👉 https://github.com/bruno-szdl/dbt-ci-cd
+Snowflake向けに設計されたCI/CDパイプラインのデモリポジトリで、PR番号とcommit SHAからpr_123__abc123def456のような一意なスキーマを動的生成してPR間の干渉を防ぐ構成 ￼。本番manifestをartifactとしてダウンロードし、dbt build -s 'state:modified+' --defer --state ./ でSlim CIを実行、PR closeでdrop_pr_schemas macroを呼んでクリーンアップする一連の流れ ￼が実装されています。
+池田さんの構成にほぼそのまま流用可能。GitHub Actions → GitBucket CI Pluginへの翻訳が主な作業。
+2. dbt-labs/jaffle-shop + dbt公式CI guide (基礎学習用)
+👉 https://github.com/dbt-labs/jaffle-shop👉 https://docs.getdbt.com/guides/set-up-ci
+dbt公式のサンプルプロジェクトで、CI実装の説明とセットで読むのが定番。dbt project evaluatorとの組み合わせ方（dbt build --select state:modified+ --exclude package:dbt_project_evaluator の後に dbt build --select package:dbt_project_evaluator を実行） ￼など、品質チェックの組み込みパターンも参考になります。
+3. dbt-beyond-the-basics (上級者向けパターン集)
+👉 awesome-dbtでも紹介されている、CIの応用パターン showcase
+Slim CIとunit testをCIに、Write-Audit-Publishパターン（dbt cloneを利用）をCDの上位環境に適用する設計 ￼が示されており、池田さんが構築中のCI構成を将来CDまで拡張する際の参考になります。
+用途別マトリクス
+
+
+
+|リポジトリ                                                                                                         |用途                        |池田さんへのフィット度|
+|--------------------------------------------------------------------------------------------------------------|--------------------------|-----------|
+|**bruno-szdl/dbt-ci-cd**                                                                                      |Snowflake実接続CIの即戦力リファレンス  |★★★★★      |
+|dbt-labs/jaffle-shop                                                                                          |公式サンプル、学習・教育用途（池田塾にも◎）    |★★★★       |
+|dbt-beyond-the-basics                                                                                         |応用パターン（unit test, defer活用）|★★★★       |
+|melbdataguy/dbt-bigquery-cicd                                                                                 |BigQuery版、コード解説が丁寧        |★★（参考のみ）   |
+|Snowflake zero-copy clone系 ([記事](https://towardsdatascience.com/running-dbt-using-gitlab-ci-cd-8a2ef0f05af0/))|クローンベースCI設計の思想理解          |★★★        |
+
+実装の進め方として推奨
+	1.	bruno-szdl/dbt-ci-cd をfork or clone して構造把握
+	2.	GitHub Actions部分をGitBucket CI Plugin形式に翻訳 (前回の回答で出した構成がそのまま使える)
+	3.	dbt-labs/jaffle-shop の models構造 を真似てサンプルプロジェクトを作り、CI動作確認
+	4.	unit test (dbt 1.8+) を追加 → dbt-beyond-the-basicsを参考に
+補足：池田塾の教材としても
+dbt-labs/jaffle-shopは構造がシンプルなので、新人エンジニア向けに「dbt + CI/CD」を教える際の教材としても優秀です。論理→物理モデルの教育コンテンツと合わせて、「設計→実装→自動テスト」の一気通貫の流れを見せられます。
+bruno-szdl/dbt-ci-cdのコードを実際に読みながら、GitBucket向けに翻訳する作業を一緒に進めましょうか？それともまずjaffle-shopでローカル動作確認から始めますか？​​​​​​​​​​​​​​​​
+
 Snowflake実接続でGitBucket CI Plugin前提の構成、池田さんの既存スタック（自己ホスト型GitBucket + Docker）に合わせて詰めていきますね。
 全体アーキテクチャ
-
+'''
 [Push/PR] → GitBucket → CI Plugin → Docker Runner
                                       ├─ Stage1: deps解決
                                       ├─ Stage2: dbt parse (offline)
@@ -10,7 +45,7 @@ Snowflake実接続でGitBucket CI Plugin前提の構成、池田さんの既存�
                                       ├─ Stage4: dbt build --select state:modified+ (CI用DB)
                                       └─ Stage5: unit test
 
-
+'''
 Snowflake側の準備
 CI専用環境を分離するのが鉄則です。
 
