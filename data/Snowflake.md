@@ -1,5 +1,82 @@
 # Snowflake
 
+----------
+了解です。bruno-szdl/dbt-ci-cd の中身を実際に取得して、GitBucket CI Plugin向けに翻訳していきましょう。​​​​​​​​​​​​​​​​
+
+構造が把握できました。重要なファイル（profiles.yml、dbt_project.yml、cleanup macro）の中身も見ておきましょう。​​​​​​​​​​​​​​​​
+
+profiles.ymlの構造が取れました。続いてcleanup macroも見ておきます。​​​​​​​​​​​​​​​​
+
+macro実体の中身までは取れませんでしたが、構造とロジックは十分把握できました。実際に動くテンプレートを作って、GitBucket向けに移植したものを成果物として作りましょう。
+skillを確認してから作業を進めます。​​​​​​​​​​​​​​​​
+
+これはアップロードファイル読み取り用のskillで、今回のテキストファイル作成タスクには不要ですね。すぐにファイル作成に進みます。
+プロジェクト構成を一式作って、最後にzipにまとめて渡します。​​​​​​​​​​​​​​​​
+
+波括弧展開がうまくいきませんでした。普通のmkdirで作り直します。​​​​​​​​​​​​​​​​
+
+ファイル群を作成していきます。​​​​​​​​​​​​​​​​
+
+次にmacroを2つ。generate_schema_nameは重要で、これがないとPR専用スキーマが正しく組み立てられません。​​​​​​​​​​​​​​​​
+
+次にDockerfileとシェルスクリプト群です。​​​​​​​​​​​​​​​​
+
+GitBucket CI Plugin設定ファイル群を作ります。GitBucket CI PluginはJenkinsfile風YAMLを採用しているので、それに合わせます。​​​​​​​​​​​​​​​​
+
+サンプルのdbtモデル群とunit testを作って、最後にSnowflakeセットアップSQLを追加します。​​​​​​​​​​​​​​​​
+
+bruno-szdl版との対比を解説するドキュメントを追加し、構造を確認します。​​​​​​​​​​​​​​​​
+
+構造を確認します。​​​​​​​​​​​​​​​​
+
+一式そろいました。zipにまとめてダウンロードできるようにします。​​​​​​​​​​​​​​​​
+
+READMEとTRANSLATION_NOTESも個別に渡せるようにコピーしておきます。​​​​​​​​​​​​​​​​
+
+bruno-szdl版をベースに、GitBucket + Docker + Snowflake向けに翻訳した一式を作成しました。
+主な翻訳ポイント
+bruno-szdl版から変えた4箇所:
+	1.	YAMLは薄く、ロジックはshellへ - GitBucket CI PluginのYAML文法はGitHub Actionsより素朴なので、if-then-else分岐はci.sh/cd.sh/teardown.shに集約。ローカルでdocker runで再現可能になる副次効果も。
+	2.	Password → Key pair認証 - SnowflakeサービスアカウントへのMFA強制トレンドに合わせ、SNOWFLAKE_PRIVATE_KEYをGitBucket SecretsからPEM全文で渡す方式に。
+	3.	GitHub Actions artifacts → MinIO/S3互換 - manifest保管先を自己ホストMinIOまたはS3互換に。boto3で操作。
+	4.	multi-stage Docker - 池田さんが採用されているパターンに合わせ、base → deps → dbt-deps → parse → ci/cdの5段構成。packages.yml/requirements.txt変更時のみ再ビルドが走るよう最適化。
+ファイル構成 (21ファイル)
+
+dbt-ci-cd-gitbucket/
+├── README.md                     # セットアップ手順
+├── TRANSLATION_NOTES.md          # bruno-szdl版との対応表
+├── snowflake_setup.sql           # Snowflake側初期化SQL
+├── dbt_project.yml, packages.yml, profiles.yml
+├── dbt-requirements.txt
+├── .gitbucket/
+│   ├── ci.yml, cd.yml, teardown.yml
+├── docker/
+│   ├── Dockerfile, ci.sh, cd.sh, teardown.sh
+├── macros/
+│   ├── generate_schema_name.sql  # PR用スキーマ命名
+│   └── drop_pr_schemas.sql       # クリーンアップ
+├── models/
+│   ├── staging/stg_orders.sql
+│   ├── marts/orders_summary.sql
+│   └── schema.yml                # unit test 2つ含む
+└── seeds/raw_orders.csv
+
+
+実行までの順序
+	1.	snowflake_setup.sql をSnowflakeで実行 (公開鍵を貼る)
+	2.	GitBucket Secretsに11個のキー登録
+	3.	ローカルで初回 dbt parse --target prod → manifestをMinIOにアップ
+	4.	PR作成 → .gitbucket/ci.yml がトリガー → Slim CIが動く
+	5.	merge → .gitbucket/cd.yml が本番デプロイ + manifest更新
+	6.	PR close → .gitbucket/teardown.yml がPR専用スキーマを削除
+次のステップ候補
+	∙	GitBucket CI Pluginの実バージョン依存事項の調整 (pull_request closedイベントの動作確認等)
+	∙	MinIO構築手順の追加 (docker-composeで5分)
+	∙	本番デプロイの慎重化: blue/green or write-audit-publishパターン追加
+	∙	池田塾教材化: 「Slim CIの仕組み」「state:modified+とは何か」を新人向けに解説
+どこから手を付けましょうか？​​​​​​​​​​​​​​​​
+----------
+
 dbtのCI/CDリファレンス実装、いくつか定番がありますね。最新情報も含めて調べておきます。​​​​​​​​​​​​​​​​
 
 いくつか定番のリファレンス実装が見つかりました。池田さんの状況（GitBucket + Docker + Snowflake想定）に照らして、用途別に整理しますね。
