@@ -1,6 +1,425 @@
 # Snowflake
 
 ----------
+Snowflakeでアクセス制限（特権制限）を設計する場合、データベース・スキーマの切り方とロール設計をセットで考えるのが定石です。池田さんがクライアント向けに設計されている文脈で、実務でよく採られるパターンを整理します。
+
+## 基本方針：ロールベースで「データの論理単位」を分離する
+
+Snowflakeの権限はロール（Role）に付与し、ユーザーにロールを割り当てる方式です。DB/スキーマの境界そのものよりも、**「誰が何にアクセスできるか」を分けやすい粒度で切る**ことが重要です。
+
+## 推奨される階層設計
+
+一般的な3層構造（メダリオンアーキテクチャに近い形）:
+
+- **DB単位**で環境を分ける: `PROD_DB` / `STG_DB` / `DEV_DB`
+- **スキーマ単位**でレイヤを分ける: `RAW` / `STAGING` / `MART` / `SANDBOX`
+- **MART配下**を業務ドメインで細分化: `MART_SALES` / `MART_FINANCE` / `MART_HR` など機密度が異なるものは別スキーマに
+
+機密度の高いデータ（人事・財務・個人情報）は**別スキーマ、あるいは別DBに隔離**すると、ロール設計がシンプルになります。
+
+## ロール設計のパターン
+
+Snowflake公式が推奨する「機能ロール（Functional Role）+ アクセスロール（Access Role）」の2層構造：
+
+- **アクセスロール**: スキーマ単位でR/Wを定義（例: `MART_SALES_R`、`MART_SALES_RW`）
+- **機能ロール**: 業務上の役割（例: `ANALYST_SALES`、`DATA_ENGINEER`、`EXECUTIVE`）にアクセスロールを継承させる
+- ユーザーには機能ロールのみを割り当てる
+
+これにより、スキーマが増えても機能ロールの組み合わせ変更だけで済みます。
+
+## 行・列レベルの制限が必要な場合
+
+スキーマ分割で足りないケース（同じテーブルを部門別に見せたい等）は:
+
+- **Row Access Policy**: 行レベルでの絞り込み（部門コードでフィルタなど）
+- **Dynamic Data Masking**: 列レベルのマスキング（メールアドレスを伏字に等）
+- **Secure View / Secure UDF**: 元テーブルを隠して必要なカラムだけ公開
+
+PoCの段階ではスキーマ分離だけで設計し、本番でRow Access Policyを足す進め方が現実的です。
+
+## PoC向けのミニマム構成例
+
+200名規模・IT担当2〜3名のクライアントなら、最初はこのくらいで十分です：
+
+- DB: `ANALYTICS_DB`（本番用）/ `DEV_DB`（開発用）
+- スキーマ: `RAW` / `MART_COMMON` / `MART_RESTRICTED`（機密データのみ）
+- ロール: `ANALYST`（MART_COMMON読取）/ `ANALYST_PRIVILEGED`（MART_RESTRICTEDも読取）/ `ENGINEER`（全書込）
+
+ところで「up制限」というのは具体的にどういう制限を想定されていますか？  「アップロード制限」「アップデート（更新）制限」「ユーザープリビレッジ制限」など解釈が分かれるので、用途に合わせてもう少し具体的な設計例を出せます。
+
+IP制限ですね、失礼しました。Snowflakeでは**Network Policy**で実現します。DB/スキーマ設計とは独立した、アカウントまたはユーザー/ロール単位の制御です。
+
+## Network Policyの基本
+
+Snowflakeでは、特定のIPアドレス範囲からの接続のみを許可する仕組みとして `NETWORK POLICY` オブジェクトを使います。CIDR形式で許可リスト（ALLOWED_IP_LIST）と拒否リスト（BLOCKED_IP_LIST）を定義できます。
+
+```sql
+CREATE NETWORK POLICY corp_office_policy
+  ALLOWED_IP_LIST = ('203.0.113.0/24', '198.51.100.10')
+  BLOCKED_IP_LIST = ()
+  COMMENT = '本社・支社からのアクセスのみ許可';
+```
+
+## 適用範囲の3つのレベル
+
+Network Policyは適用先によって粒度が変わります。
+
+- **アカウントレベル**: 全ユーザーに一律適用。最も強力だが、管理者が締め出されるリスクあり
+- **ユーザーレベル**: 個別ユーザーに適用。アカウントレベルより優先される
+- **統合（Security Integration）レベル**: SCIM・OAuth等の特定の認証経路にのみ適用
+
+```sql
+-- アカウント全体に適用
+ALTER ACCOUNT SET NETWORK_POLICY = corp_office_policy;
+
+-- 特定ユーザーのみに適用（アカウント設定を上書き）
+ALTER USER tanaka_san SET NETWORK_POLICY = corp_office_policy;
+```
+
+## DB/スキーマ設計との関係
+
+ここがポイントですが、**Network PolicyはDB/スキーマ設計とは直交する**概念です。「このスキーマにアクセスできるIPを制限したい」という直接的な仕組みはありません。
+
+実務での回避策は2パターン：
+
+**パターン1: ロールごとに専用ユーザーを作り、ユーザー単位でIP制限**
+
+機密データ用ロール（例: `ANALYST_PRIVILEGED`）を使うためには専用ユーザーでログインする必要がある、という運用にして、そのユーザーにNetwork Policyを適用します。
+
+**パターン2: 機密データを別Snowflakeアカウントに分離**
+
+PoC段階ではオーバースペックですが、規制業種（金融・医療）では機密データだけ別アカウントに隔離し、アカウントレベルでIP制限をかけることがあります。
+
+## PoC向けの現実的な構成
+
+200名規模のクライアントなら、こんな順序で導入するのが無理がないです：
+
+1. まずアカウントレベルで「社内VPN + クライアント拠点」のIPを許可
+2. ACCOUNTADMIN等の特権ロールを使う管理者ユーザーは、より狭いIP（情シス端末のみ等）で別途縛る
+3. BIツールやETLサービス（Fivetran等）のIPレンジは別途許可リストに追加
+
+## 注意点
+
+- **設定前に自分のIPを確認**してください。CIDR間違いで全員ロックアウトされると、Snowflakeサポートに連絡しないと復旧できません
+- **PrivateLink（AWS/Azure）を使う場合**は、Network Policyに加えて `ALLOWED_VPCE_IDS` でVPCエンドポイント制限も可能です
+- **動的IPの社員**（在宅勤務等）がいる場合はVPN経由に統一するか、SSOと組み合わせるのが現実的です
+
+クライアントは固定IPのオフィス出社中心ですか、それともリモートワーカーが多い構成ですか？ それによって設計の落とし所が変わります。
+
+
+ELT用ユーザーは「人ではないアクセス（machine-to-machine）」なので、人間ユーザーとは別の設計思想で組みます。Snowflakeの推奨プラクティスを踏まえた設計を整理します。
+
+## 基本方針：用途ごとに専用ユーザーを作る
+
+ELTツールやサービスごとに1ユーザー、が原則です。同じツール内でもジョブの責務が違えば分ける価値があります。
+
+- **ロード用**: 外部ステージ → RAWスキーマへのデータ投入（Fivetran、Airbyte、独自Pythonバッチ等）
+- **変換用**: RAW → STAGING → MARTへの変換（dbt、Dataform等）
+- **オーケストレーション用**: ジョブ起動・監視（Airflow、Prefect等）
+
+これらを分けると、障害時の影響範囲特定・権限の最小化・コスト按分（後述のWarehouse分離）がやりやすくなります。
+
+## 認証方式：パスワードではなくキーペア認証
+
+ELT用途では**Key-Pair Authentication**が推奨です。理由は以下のとおり：
+
+- パスワードは漏洩リスクと定期ローテーション運用がつらい
+- Snowflakeは2025年以降、サービスアカウントでのパスワード認証を段階的に廃止する方針を打ち出しています
+- Python connectorやdbt、各種ETLツールが標準対応
+
+```sql
+CREATE USER svc_dbt_prod
+  TYPE = SERVICE  -- サービスアカウント専用タイプ（MFA対象外）
+  DEFAULT_ROLE = DBT_TRANSFORMER
+  DEFAULT_WAREHOUSE = WH_TRANSFORM
+  RSA_PUBLIC_KEY = 'MIIBIjANBgkqhk...'
+  COMMENT = 'dbt Cloud production runner';
+```
+
+`TYPE = SERVICE` は人間ユーザーと明確に区別する新しいユーザータイプで、MFA強制ポリシーの対象外にできます（パスワード認証も不可になる仕様）。
+
+## ロール設計：機能ロールを別建てで作る
+
+人間用の `ANALYST` 等とは別に、ELT専用ロールを作ります。
+
+- **`LOADER`**: 外部ステージ読取 + RAWスキーマへのINSERT/COPY/MERGE権限
+- **`TRANSFORMER`**: RAW読取 + STAGING/MART配下のフルCRUD + 必要ならスキーマ作成権限
+- **`REPORTER`**: MART読取のみ（BIツール用）
+
+dbtのようなツールは「テーブルを作って入れ替える」操作をするので、TRANSFORMERにはスキーマレベルの `CREATE TABLE / VIEW` 権限を付与します。FUTURE GRANTSで自動付与にしておくと運用が楽です：
+
+```sql
+GRANT USAGE ON DATABASE ANALYTICS_DB TO ROLE TRANSFORMER;
+GRANT USAGE ON SCHEMA ANALYTICS_DB.MART TO ROLE TRANSFORMER;
+GRANT CREATE TABLE, CREATE VIEW ON SCHEMA ANALYTICS_DB.MART TO ROLE TRANSFORMER;
+GRANT SELECT ON FUTURE TABLES IN SCHEMA ANALYTICS_DB.MART TO ROLE REPORTER;
+```
+
+## Warehouseも分ける
+
+ELT用ユーザーには専用Warehouseを `DEFAULT_WAREHOUSE` に設定します。
+
+- **WH_LOAD**: ロード用（XS〜S、頻繁起動）
+- **WH_TRANSFORM**: 変換用（M〜L、夜間バッチで一気に動く）
+- **WH_BI**: BI用（S、`AUTO_SUSPEND = 60` 等で短く）
+
+これによりコスト按分・性能干渉の回避・モニタリングがクリアになります。RESOURCE_MONITORで上限を別個に設定できるのも利点です。
+
+## IP制限との組み合わせ
+
+前回のNetwork Policyの話とつながるところです。ELT用ユーザーは**接続元IPが固定または範囲が明確**なので、人間ユーザーより厳しくIP制限をかけられます。
+
+- 自社サーバーのバッチ → 自社のNAT固定IP
+- Fivetran等のSaaS → 各社が公開しているIPレンジを許可リストに追加
+- AWS上のAirflow → VPCのNAT GatewayのEIP、またはPrivateLink
+
+```sql
+CREATE NETWORK POLICY policy_svc_dbt
+  ALLOWED_IP_LIST = ('10.20.30.40/32');  -- dbt Cloud のIPなど
+
+ALTER USER svc_dbt_prod SET NETWORK_POLICY = policy_svc_dbt;
+```
+
+ユーザー単位のNetwork Policyはアカウントレベルを上書きするので、**人間ユーザーは社内VPN経由のみ・ELTユーザーはサービスのIPのみ**といった使い分けができます。
+
+## PoC段階での現実的な落とし所
+
+200名規模のクライアントで池田さんがPoC支援する文脈なら、こんな粒度から始めるのがおすすめです：
+
+- ユーザー: `SVC_LOADER` / `SVC_DBT` の2つ
+- ロール: `LOADER` / `TRANSFORMER` の2つ（人間用の `ANALYST` とは別建て）
+- Warehouse: `WH_LOAD` / `WH_TRANSFORM` の2つ
+- 認証: 最初からキーペア認証で構築（後から移行は面倒）
+- IP制限: 自社バッチサーバーのIPのみ許可
+
+本番展開で `SERVICE` ユーザータイプ・FUTURE GRANTS・RESOURCE_MONITORを足していく流れが無理がないです。
+
+ELTツールは具体的に何を使う想定ですか？ dbtかFivetranか自前Pythonかで、ロール権限の細かい付け方（特に `CREATE TABLE` の必要性）が変わります。
+
+
+業務ロールとシステムロールを統合して設計する話ですね。Snowflake全体のロール設計の定石を、PoC〜本番展開を見据えて整理します。
+
+## 基本思想：3層構造で組む
+
+Snowflakeのロール設計は、機能（業務）と権限（アクセス）を分離する**3層構造**が王道です。
+
+```
+┌─────────────────────────────────────────┐
+│ 1. システムロール（Snowflake標準）      │  ACCOUNTADMIN, SECURITYADMIN, SYSADMIN等
+├─────────────────────────────────────────┤
+│ 2. 機能ロール（Functional Role）        │  業務上の役割。ユーザーに割り当てる
+├─────────────────────────────────────────┤
+│ 3. アクセスロール（Access Role）        │  オブジェクト単位のR/W権限の塊
+└─────────────────────────────────────────┘
+        ↓ 継承（GRANT ROLE）
+    オブジェクト（DB/Schema/Table/Warehouse）
+```
+
+ユーザーには**機能ロールのみ**を割り当て、機能ロールがアクセスロールを継承する形にします。これにより、オブジェクトが増減しても機能ロール側の変更は最小限で済みます。
+
+## 1層目：Snowflake標準のシステムロール
+
+これは最初から存在するロールで、用途を理解した上で**誰に使わせるか**を決めることが設計の出発点です。
+
+- **ORGADMIN**: 組織全体（複数アカウント）の管理。通常はSnowflake契約担当者のみ
+- **ACCOUNTADMIN**: アカウント最上位権限。緊急時のbreak-glass用、日常利用は避ける
+- **SECURITYADMIN**: ユーザー・ロール・Network Policyの管理
+- **USERADMIN**: ユーザーとロールの作成のみ（権限付与は不可）
+- **SYSADMIN**: DB/Warehouse/オブジェクトの作成・管理。**全カスタムロールの親**にする
+- **PUBLIC**: 全ユーザーが自動所属。ここに何かを付与すると全員に見えるので注意
+
+実務での運用ルール：
+
+- ACCOUNTADMINは2〜3名の専任管理者のみ、MFA必須、break-glassアカウントは別管理
+- 日常的なオブジェクト管理はSYSADMINで行う
+- **カスタムロールは必ずSYSADMINを親にする**（`GRANT ROLE custom_role TO ROLE SYSADMIN`）
+
+## 2層目：機能ロール（業務ロール）
+
+業務上の「役割」を表現します。組織図や職務定義書から起こすイメージです。
+
+PoC段階の例：
+
+- **`ANALYST`**: 一般的なデータ分析者。MART全般を読み取り
+- **`ANALYST_PRIVILEGED`**: 機密データ含む分析者。人事・財務MARTも読み取り
+- **`DATA_ENGINEER`**: パイプライン開発者。RAW/STAGING/MARTすべて操作可能
+- **`EXECUTIVE`**: 経営層。ダッシュボード用ビューのみ閲覧
+- **`DEVELOPER`**: 開発環境のみフルアクセス、本番は読取のみ
+
+システム/ELT系の機能ロール（前回の続き）：
+
+- **`SVC_LOADER`**: ロード処理用
+- **`SVC_TRANSFORMER`**: dbt等の変換処理用
+- **`SVC_BI`**: BIツールのサービスアカウント用
+
+## 3層目：アクセスロール
+
+オブジェクト単位の権限の「部品」です。命名規約を統一すると後で読み解きやすくなります。
+
+命名例：`<DB>_<SCHEMA>_<権限レベル>`
+
+- `ANALYTICS_MART_R`（読取のみ）
+- `ANALYTICS_MART_RW`（読み書き）
+- `ANALYTICS_RAW_R`
+- `ANALYTICS_RAW_RW`
+- `ANALYTICS_MART_RESTRICTED_R`（機密データ）
+- `WH_TRANSFORM_USAGE`（Warehouse利用権限）
+
+## 全体を組み合わせた継承図
+
+PoC構成での具体例：
+
+```
+ユーザー: tanaka_san  →  ANALYST
+                              ├── ANALYTICS_MART_R
+                              ├── ANALYTICS_MART_COMMON_R
+                              └── WH_BI_USAGE
+
+ユーザー: yamada_san  →  ANALYST_PRIVILEGED
+                              ├── ANALYTICS_MART_R
+                              ├── ANALYTICS_MART_RESTRICTED_R  ← ここが追加
+                              └── WH_BI_USAGE
+
+ユーザー: SVC_DBT     →  SVC_TRANSFORMER
+                              ├── ANALYTICS_RAW_R
+                              ├── ANALYTICS_STAGING_RW
+                              ├── ANALYTICS_MART_RW
+                              └── WH_TRANSFORM_USAGE
+
+全カスタムロール → SYSADMIN
+```
+
+## オーナーシップとSYSADMIN集約の原則
+
+オブジェクトを作成したロールが**そのオブジェクトのオーナー**になります。バラバラのロールがオーナーになると権限管理が破綻するので：
+
+- すべてのDB/Schema/TableはSYSADMIN（または SYSADMIN配下の専用ロール）が所有
+- アクセスロールはSECURITYADMIN または USERADMINが作成・管理
+- ELTツールが新規テーブルを作る場合は、`USE SECONDARY ROLES` や `MANAGED ACCESS SCHEMA` を活用してオーナーシップ管理を簡略化
+
+## MANAGED ACCESS SCHEMAの活用
+
+スキーマレベルで `WITH MANAGED ACCESS` を付けると、**そのスキーマ内のオブジェクトへのGRANTはスキーマオーナーのみが実行可能**になります。dbtが勝手にGRANTを書き換えるのを防げるので、本番MARTには適用推奨です。
+
+```sql
+CREATE SCHEMA ANALYTICS.MART WITH MANAGED ACCESS;
+```
+
+## 環境分離との掛け合わせ
+
+DEV/STG/PRODでロールも分けるか、同じロールで環境ごとに権限を変えるかは設計判断です。
+
+**推奨パターン: 環境ごとに別ロール**
+
+- `ANALYST_PROD` / `ANALYST_DEV`
+- `SVC_TRANSFORMER_PROD` / `SVC_TRANSFORMER_DEV`
+
+PRODのサービスアカウントが事故でDEVを壊す事態を防げます。dbtでprofile分けるのとも整合性が取れます。
+
+## PoC向けの最小構成
+
+200名規模のクライアントなら、最初はこのくらいで十分です：
+
+機能ロール 5つ：
+
+- `ANALYST`（一般分析者）
+- `ANALYST_PRIVILEGED`（機密データも見られる）
+- `DATA_ENGINEER`（開発・運用）
+- `SVC_LOADER`（ELTロード）
+- `SVC_TRANSFORMER`（dbt等）
+
+アクセスロール 6つ：
+
+- `ANALYTICS_RAW_R` / `ANALYTICS_RAW_RW`
+- `ANALYTICS_MART_R` / `ANALYTICS_MART_RW`
+- `ANALYTICS_MART_RESTRICTED_R`
+- `WH_*_USAGE`（Warehouseごと）
+
+これで100〜200名規模なら回ります。本番展開時に部門別MARTが増えたら、アクセスロールを追加して機能ロールに継承させるだけで拡張できます。
+
+## 設計時の注意点
+
+- **PUBLICロールに何も付与しない**（うっかり全員に見える事故を防ぐ）
+- **ACCOUNTADMINでオブジェクトを作らない**（オーナーシップ管理が破綻する）
+- **FUTURE GRANTSを活用**（新規テーブル作成時の権限付与漏れを防ぐ）
+- **ロール命名は最初から規約を決める**（後から大文字小文字統一は地獄）
+- **break-glassアカウント**（緊急時用ACCOUNTADMIN）を別建てで用意し、認証情報を金庫管理
+
+ところでクライアントの組織体制は、データ分析・データエンジニアリングを情シス内でやる構造ですか？ それとも事業部側にもアナリストがいる構造ですか？ 後者の場合は部門別MARTとロールの掛け合わせが必要になるので、もう少し設計を細かく詰める価値があります。
+
+
+はい、その理解で正しいです。**アクセスロールをユーザーに直接付与しない**のは、ELT用ユーザーであっても守るべき原則です。
+
+## なぜ機能ロールを経由すべきか
+
+アクセスロールを直接付ける運用にすると、設計の意図が崩れていきます。
+
+**1. 権限の組み合わせが追跡不能になる**
+
+人間ユーザーAには `MART_R` だけ、Bには `MART_R` + `RAW_R`、Cには `MART_R` + `RAW_R` + `RESTRICTED_R`... と直接付与していくと、「このユーザーは結局何ができるのか」がユーザーごとに違ってきます。100人いたら100通りの権限プロファイルが生まれ、棚卸しが困難になります。
+
+機能ロールを経由すれば、「このユーザーは `ANALYST_PRIVILEGED` だから人事データも見える」と一意に説明できます。
+
+**2. 権限変更の影響範囲が読めなくなる**
+
+「分析者全員にRAW読取権限を追加したい」となった時、機能ロールに `RAW_R` を1回GRANTすれば全員に反映されます。直接付与だと、ユーザー全員に対して個別にGRANTする必要があり、追加漏れが必ず発生します。
+
+**3. 監査・棚卸しが破綻する**
+
+退職者や異動者の権限剥奪時、機能ロール経由なら「ロールの割当を外す」だけで完了します。直接付与だと、そのユーザーが持つすべてのアクセスロールを個別に確認・剥奪する必要があり、剥奪漏れが起きます。
+
+## ELT用ユーザーでも同じ理由が当てはまる
+
+「ELTユーザーは1個だけだから機能ロールを挟む意味がないのでは？」と思いがちですが、実際は人間ユーザー以上に機能ロールを挟む価値があります。
+
+**1. 環境ごとに同じ「役割」が必要になる**
+
+`SVC_DBT_PROD` と `SVC_DBT_DEV` は別ユーザーですが、**役割としては同じ「dbt変換実行者」**です。機能ロール `SVC_TRANSFORMER` を定義しておけば、環境別ユーザーに同じロールを付与でき、権限構成の一貫性が保てます。
+
+**2. ツールの追加・差し替えに対応できる**
+
+dbtの代わりにDataformを試したい、Airflowにも変換ジョブを持たせたい、となった時、新しいユーザーに `SVC_TRANSFORMER` を付与するだけで済みます。アクセスロールを直接付けていると、ツールごとに同じ権限セットを組み直す手間が発生します。
+
+**3. 監査ログで「何の役割の処理か」が読み取りやすい**
+
+`QUERY_HISTORY` を見た時、`ROLE_NAME` が `SVC_TRANSFORMER` になっていれば変換系の処理だと一目で分かります。アクセスロールが直接動いていると、`ANALYTICS_MART_RW` のような名前が並び、業務的な文脈が読み取りにくくなります。
+
+**4. 将来の冗長化・並列化に対応**
+
+「日次バッチと時間バッチでdbtユーザーを分けたい」「コスト分析のためにジョブ別にユーザーを分けたい」となった時、機能ロールがあれば即座に複数ユーザーに同じ役割を割り当てられます。
+
+## 例外的に許容されるケース
+
+厳密に「絶対NG」ではなく、以下のような場合は許容されることもあります。
+
+- **使い捨ての一時ユーザー**（PoCの数日だけ動かす検証用）
+- **ROLE階層を使えないツール**（極めて稀。最近のツールはほぼ対応）
+- **Snowflake標準ロール（SYSADMIN等）の直接利用**（これはそもそも機能ロールの一種と見なせる）
+
+ただし「一時的」が「いつのまにか恒久化」するのが現場の常なので、PoCでも最初から機能ロール経由で組んでおくのが結果的に楽です。
+
+## 推奨される構造の再確認
+
+```
+ユーザー (SVC_DBT_PROD)
+    ↓ GRANT ROLE
+機能ロール (SVC_TRANSFORMER)
+    ↓ GRANT ROLE
+アクセスロール (ANALYTICS_RAW_R, ANALYTICS_MART_RW, WH_TRANSFORM_USAGE)
+    ↓ GRANT 権限
+オブジェクト (Database, Schema, Table, Warehouse)
+```
+
+ユーザーは機能ロールしか知らない、機能ロールはアクセスロールの組み合わせを知っている、アクセスロールはオブジェクト権限の塊を持っている、という3層の責務分離です。
+
+この原則は、Snowflakeのドキュメントでも公式に推奨されているパターンで、規模が小さくても適用する価値があります。むしろ規模が大きくなってから3層化するのは権限の付け替え地獄になるので、PoC段階から徹底するのが鉄則です。
+
+池田塾でDB設計を教えられている文脈で言えば、これは**「正規化」と同じ発想**ですね。直接付与は「権限の非正規化」で、最初は楽に見えても更新異常を必ず引き起こす、という構造です。
+
+
+
+
+----------
 了解です。bruno-szdl/dbt-ci-cd の中身を実際に取得して、GitBucket CI Plugin向けに翻訳していきましょう。​​​​​​​​​​​​​​​​
 
 構造が把握できました。重要なファイル（profiles.yml、dbt_project.yml、cleanup macro）の中身も見ておきましょう。​​​​​​​​​​​​​​​​
