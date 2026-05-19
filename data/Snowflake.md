@@ -1,5 +1,223 @@
 # Snowflake
 
+-------------
+
+これは「データ量」だけでは決まりません。
+dbtの処理内容（集計・JOIN・MERGEの重さ）と実行頻度 の方が効きます。
+
+ただ、Snowflake中心か AWS(Fargate/Python/Spark)中心かの境目を、実務感覚でざっくり示すとこうなります。
+
+まず重要：同じSQL変換ならFargateでもSnowflake課金は消えない
+
+例えば：
+
+Fargate
+ ↓
+dbt run
+ ↓
+Snowflake SQL実行
+ ↓
+Snowflake Warehouse課金
+
+この場合、Fargateを使っても Snowflakeの計算コストはほぼ残ります。
+
+なので比較対象は本当は：
+
+A. Snowflakeで変換
+
+COPY INTO
+↓
+Snowflake dbt
+↓
+Gold
+
+B. AWSで変換して最後だけSnowflakeへ
+
+S3
+↓
+Spark / Glue / ECS / Fargate
+↓
+加工済みデータ
+↓
+Snowflake
+
+です。
+
+⸻
+
+ざっくり境界（経験則）
+
+前提：
+	•	日次ELT
+	•	Parquet中心
+	•	中規模JOINあり
+	•	Gold集計あり
+
+生データ量/日	Snowflake中心	AWS変換中心	傾向
+～10GB/日	◎	×	Snowflake圧勝
+10～100GB/日	◎	△	Snowflake優勢
+100GB～1TB/日	○	○	境目
+1TB～5TB/日	△	◎	AWS有利になり始める
+5TB+/日	×	◎	Spark/Glue系が有利
+
+かなり大雑把ですが、1TB/日超 が境目です。
+
+⸻
+
+なぜ境界がその辺？
+
+例：
+
+50GB/日
+
+raw 50GB
+↓
+JOIN
+↓
+集計
+↓
+mart
+
+Snowflake：
+
+XS～M Warehouse
+数千円～数万円/月
+
+かなり安い。
+
+⸻
+
+2TB/日
+
+変換：
+
+2TB raw
+↓
+巨大JOIN
+↓
+MERGE
+↓
+履歴管理
+
+Snowflake：
+
+Warehouseサイズ増：
+
+L～2XL
+
+クレジット増加。
+
+一方AWS：
+
+Glue Spark
+EMR
+Fargate分散
+
+で処理すると安くなるケースが出る。
+
+⸻
+
+ただしdbtはJOIN中心なので…
+
+dbt処理は典型的に：
+
+SELECT
+JOIN
+GROUP BY
+WINDOW
+MERGE
+
+です。
+
+これは Snowflakeが非常に得意。
+
+なので境界はさらに後ろへずれます。
+
+実務では：
+
+数百GB/日
+
+でもSnowflakeだけで回っている会社は多いです。
+
+⸻
+
+AWSが安くなる典型パターン
+
+これなら早めに逆転します。
+
+パターン1：Python前処理
+
+API
+↓
+Pandas
+↓
+特徴量
+↓
+Snowflake
+
+→ AWS有利
+
+⸻
+
+パターン2：画像・ログ
+
+IoT
+ログ
+画像
+
+→ Glue/Spark有利
+
+⸻
+
+パターン3：全量再計算
+
+毎回：
+
+5TB
+↓
+全部再集計
+
+→ AWS寄り
+
+⸻
+
+あなたの想定（Snowflake + dbt + S3 + ELT）
+
+過去の質問を見ると、かなり典型的な分析基盤です。
+
+私は目安として：
+
+100GB/日未満
+→ Snowflake内完結
+
+100GB～1TB/日
+→ まずSnowflake継続
+
+1TB/日超
+→ Glue/Spark検討開始
+
+数TB/日
+→ AWS変換を真剣検討
+
+にします。
+
+⸻
+
+一番現実的には、「データ量」より 月間Snowflakeクレジット消費 を見る方が判断しやすいです。
+
+例えば：
+
+月500 credit未満
+→ 気にしなくてよい
+
+1000～3000 credit
+→ 最適化開始
+
+5000 credit超
+→ AWS側変換を比較検討
+
+この辺からコスト会議が始まりやすいです。
+
 -----------
 
 ￼￼￼￼￼￼￼データウェアハウス（特に Snowflake + AWS + ELT + dbt を想定した一般的な分析基盤）で、IPA 非機能要求グレード（NFR）必須項目のみを使って整理すると、だいたい以下が最低ラインになります。
