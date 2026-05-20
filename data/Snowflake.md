@@ -2,6 +2,106 @@
 
 -------------
 
+おはようございます。
+Lambda → Fargateの構成、いい選択です。dbtはビルド時間が読みにくいのでLambdaの15分制約から解放されるFargate委譲は理にかなっています。
+サブネット設計の基本方針
+Fargateタスクはプライベートサブネットに配置が原則です。理由は明確で、Snowflakeへの通信は外向きTLSのみで完結し、外部から接続される必要が一切ないためです。
+推奨構成
+
+VPC (10.0.0.0/16)
+├── Public Subnet  (10.0.1.0/24) ← NAT Gateway のみ
+├── Public Subnet  (10.0.2.0/24) ← NAT Gateway のみ (Multi-AZ)
+├── Private Subnet (10.0.10.0/24) ← Lambda + Fargate
+└── Private Subnet (10.0.11.0/24) ← Lambda + Fargate (Multi-AZ)
+
+
+サブネットの考え方
+Multi-AZで最低2つのプライベートサブネットを切るのが定石です。Fargateは指定したサブネット群からランダムに配置を選ぶため、単一AZだとAZ障害でジョブが止まります。バッチ用途なら3AZまで広げる必要は通常ありません。
+CIDRサイズはFargateタスク数の上限を意識。Fargateタスク1つにつきENIを1つ消費するので、/24 (約250 IP) あれば日次バッチには十分。並列度を上げる予定があれば /22 程度に。
+Snowflakeへの経路設計の選択肢
+ここが本題で、3つの選択肢があります。
+選択肢A: NAT Gateway経由 (シンプル)
+
+Fargate → NAT GW → Internet → Snowflake (Public Endpoint)
+
+
+	∙	メリット: 構成が単純、すぐ動く
+	∙	デメリット: NAT GW料金 ($0.045/h + データ転送) が地味に効く、Snowflakeのallowlist制御はIP単位
+選択肢B: Snowflake Private Link経由 (推奨) ⭐
+
+Fargate → VPC Endpoint → AWS PrivateLink → Snowflake
+
+
+	∙	メリット:
+	∙	NAT GW不要 (コスト削減)
+	∙	通信がAWSバックボーン内で完結 (セキュリティ◎)
+	∙	SnowflakeのNetwork PolicyでPRIVATE_LINK制限可能
+	∙	デメリット: Snowflake Business Critical edition以上 が必要
+	∙	池田さんのクライアントPoCがStandard editionだと使えない点に注意
+選択肢C: NAT GW + Snowflake Network Policy (現実解)
+Business Criticalでない場合、NAT GWのEIPを固定IPにしてSnowflake側でallowlist。
+
+CREATE NETWORK POLICY prod_dbt_policy
+  ALLOWED_IP_LIST = ('203.0.113.10/32');  -- NAT GW EIP
+
+ALTER USER DBT_PROD_USER SET NETWORK_POLICY = prod_dbt_policy;
+
+
+VPCエンドポイント (PrivateLink to AWS Services)
+NAT GW経由でも、以下のAWSサービス向けエンドポイントは作っておくべきです。
+
+
+
+|エンドポイント            |用途                              |タイプ         |
+|-------------------|--------------------------------|------------|
+|**S3**             |dbt artifacts (manifest.json) 保管|Gateway (無料)|
+|**ECR**            |Fargateイメージpull                 |Interface   |
+|**CloudWatch Logs**|Fargateログ送信                     |Interface   |
+|**Secrets Manager**|Snowflake秘密鍵取得                  |Interface   |
+|**ECS**            |Fargateコントロールプレーン               |Interface   |
+
+これらを置くと、AWS内通信がNAT GWを経由しなくなり、コスト・レイテンシ両面で効きます。特にECRからのイメージpullは毎回数十MB～数百MB流れるので、効果が大きいです。
+Lambda側のサブネット配置
+Lambdaはプライベートサブネットに配置するかどうかで挙動が変わります。
+	∙	VPC外に置く (デフォルト): Fargate起動APIを叩くだけならVPC不要、コールドスタート速い
+	∙	VPC内に置く: 同じVPC内のリソース (RDS等) にアクセスする場合のみ
+「LambdaがRunTask API呼ぶだけ」ならVPC外に置くのが正解。VPC内Lambdaは初期化に時間がかかり、ENI管理も増えるので、必要性がない限り避けます。
+まとめ図
+
+[EventBridge / SQS]
+        ↓
+[Lambda (VPC外)] ──RunTask API──┐
+                                  ↓
+   ┌────────── VPC ──────────────────────┐
+   │  Private Subnet A    Private Subnet B │
+   │  ┌──────────────┐   ┌──────────────┐ │
+   │  │ Fargate Task │   │ Fargate Task │ │
+   │  └──────┬───────┘   └──────┬───────┘ │
+   │         │                   │         │
+   │  ┌──────┴───────────────────┴───────┐ │
+   │  │  VPC Endpoints (S3/ECR/Logs/SM)  │ │
+   │  └────────────┬─────────────────────┘ │
+   │               │                        │
+   │  ┌────────────┴──────────────────────┐ │
+   │  │ Snowflake PrivateLink Endpoint    │ │
+   │  │ (or NAT GW → Internet)            │ │
+   │  └───────────────────────────────────┘ │
+   └────────────────────────────────────────┘
+                       ↓
+                   [Snowflake]
+
+
+池田さんへの確認ポイント
+設計を決めるのに必要な情報があります:
+	∙	クライアントのSnowflake editionは? (Business Critical以上ならPrivateLink推奨)
+	∙	マルチリージョン要件は? (通常Tokyoのap-northeast-1単一でOKなはず)
+	∙	dbt run並列度の想定は? (CIDR設計に影響)
+	∙	Lambdaの役割は? (単純なFargateキック? or 何か前処理あり?)
+これが分かると、具体的なCIDRと構成図まで詰められます。どこから深掘りしましょうか?​​​​​​​​​​​​​​​​
+
+--------------
+
+
 SnowflakeのSLAは少し独特で、「システム稼働率」だけではなく、クエリ実行成功率（query success rate）」で定義されています。ここがAWS EC2や一般システムと違います。
 
 整理すると、Snowflakeの公式な考え方は主に以下です。
