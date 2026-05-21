@@ -2,6 +2,128 @@
 
 -------------
 
+EIPの取得方法、AWS Management Console / CLI / CloudFormationの3通り紹介します。
+前提: EIPの2つの取得パターン
+
+パターン1: 先にEIPを確保 → 後でNAT Gatewayに紐付け  (推奨)
+パターン2: NAT Gateway作成時に自動でEIP割当       (お手軽)
+
+
+パターン1が推奨です。理由は、NAT Gateway誤削除時の復旧で同じIPを再利用できること、Snowflake Network Policyに登録するIPを先に確定できること、IaCで管理しやすいことです。
+マネジメントコンソールでの取得 (パターン1)
+	1.	VPCコンソールを開く
+	2.	左メニューの Elastic IPs をクリック
+	3.	Allocate Elastic IP address ボタン
+	4.	設定画面:
+	∙	Network Border Group: ap-northeast-1 (東京)
+	∙	Public IPv4 address pool: Amazon’s pool of IPv4 addresses を選択
+	∙	Tags: Name = nat-gw-prod-eip など分かりやすく
+	5.	Allocate クリック
+これで 203.0.113.10 のようなIPが払い出されます。
+その後NAT Gateway作成時に「Existing」を選んでこのEIPを指定します。
+AWS CLIでの取得
+
+# 1. EIP確保
+aws ec2 allocate-address \
+  --domain vpc \
+  --tag-specifications 'ResourceType=elastic-ip,Tags=[{Key=Name,Value=nat-gw-prod-eip}]' \
+  --region ap-northeast-1
+
+# レスポンス例:
+# {
+#   "PublicIp": "203.0.113.10",
+#   "AllocationId": "eipalloc-0abc123def456",
+#   "Domain": "vpc"
+# }
+
+# 2. AllocationIdをメモして、NAT GW作成時に指定
+aws ec2 create-nat-gateway \
+  --subnet-id subnet-xxxxx \
+  --allocation-id eipalloc-0abc123def456 \
+  --tag-specifications 'ResourceType=natgateway,Tags=[{Key=Name,Value=nat-gw-prod}]'
+
+
+Terraform / CloudFormation での取得
+Terraform:
+
+resource "aws_eip" "nat_gw" {
+  domain = "vpc"
+  
+  tags = {
+    Name = "nat-gw-prod-eip"
+  }
+  
+  # 誤削除防止
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "aws_nat_gateway" "main" {
+  allocation_id = aws_eip.nat_gw.id
+  subnet_id     = aws_subnet.public_a.id
+  
+  tags = {
+    Name = "nat-gw-prod"
+  }
+}
+
+# Snowflakeに登録するIPを出力
+output "nat_gateway_eip" {
+  value = aws_eip.nat_gw.public_ip
+}
+
+
+CloudFormation:
+
+Resources:
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: nat-gw-prod-eip
+    DeletionPolicy: Retain  # スタック削除時もEIPは残す
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnetA
+
+
+重要な運用上の注意
+1. リージョンごとに上限があるデフォルトでアカウント・リージョンあたり5個まで。それ以上必要ならサービスクォータで上限緩和申請。
+2. リリース忘れに注意EIPは確保したまま未割当の状態だと $0.005/h (約$3.6/月) 課金されます。NAT GW削除後にEIPだけ残してしまうケースがありがちなので、不要になったら必ず release する。
+
+# EIPの解放
+aws ec2 release-address --allocation-id eipalloc-0abc123def456
+
+
+3. リージョン縛りEIPはリージョン固定。東京で取ったEIPを大阪リージョンには持っていけません。
+4. 払い出されるIPは選べない通常のAmazon poolからはランダムなIPが割り当てられます。特定のIP範囲を指定したい場合はBYOIP (Bring Your Own IP) という別機能が必要ですが、これは社用IPアドレスブロックを持っている大企業向け。
+池田さんの構成での推奨手順
+	1.	先にEIP確保 (AllocationIdをメモ)
+	2.	Snowflake Network Policy作成 (このIPを登録)
+	3.	NAT Gateway作成 (1.のEIPを指定)
+	4.	Terraformで管理 (prevent_destroy でガード)
+
+# 実際のコマンド例
+aws ec2 allocate-address --domain vpc \
+  --tag-specifications 'ResourceType=elastic-ip,Tags=[
+    {Key=Name,Value=dbt-prod-nat-eip},
+    {Key=Purpose,Value=Snowflake allowlist},
+    {Key=Environment,Value=prod}
+  ]' \
+  --region ap-northeast-1
+
+
+Tagに「Snowflake allowlistに登録済み」と明記しておくと、運用引継ぎ時に「これ消していいやつ？」事故を防げます。
+Multi-AZ構成にする場合は同じ手順で2つ確保し、Snowflake側のallowlistにも両方登録します。
+次に進むなら、Terraformで一式書き起こしますか? それともSnowflake Network Policyの設定SQLを準備しますか?​​​​​​​​​​​​​​​​
+
+-------------
 おはようございます。
 Lambda → Fargateの構成、いい選択です。dbtはビルド時間が読みにくいのでLambdaの15分制約から解放されるFargate委譲は理にかなっています。
 サブネット設計の基本方針
