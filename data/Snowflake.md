@@ -1,6 +1,181 @@
 # Snowflake
 
 
+良いところに気付かれましたね。これはSnowflakeの設計でよく議論になるポイントで、「論理的にはアカウント全体で共通化したいが、物理的にはスキーマ配下にしか作れない」というギャップをどう埋めるかという話です。いくつかの定石パターンがあります。
+解決の基本方針：「集約スキーマ」を作る
+File Formatをスキーマ配下にしか作れないなら、「全社共通オブジェクトを置くための専用スキーマ」を1つ作って、そこに集約するのが定石です。物理的にはスキーマ配下ですが、運用上は「アカウント全体の共通リソース」として扱います。
+パターン1：共通DBに集約（推奨）
+全社共通のオブジェクトを置く専用DBを作り、そこのスキーマに集約します。
+
+-- 全社共通リソース用DB
+CREATE DATABASE COMMON_DB;
+CREATE SCHEMA COMMON_DB.FILE_FORMATS;
+CREATE SCHEMA COMMON_DB.FUNCTIONS;    -- 共通UDF
+CREATE SCHEMA COMMON_DB.MASKING;      -- 共通マスキングポリシー
+
+-- 共通File Format定義
+CREATE FILE FORMAT COMMON_DB.FILE_FORMATS.FF_CSV_STANDARD
+  TYPE = CSV FIELD_DELIMITER = ',' SKIP_HEADER = 1
+  NULL_IF = ('NULL', 'null', '', 'N/A')
+  EMPTY_FIELD_AS_NULL = TRUE
+  COMMENT = '全社標準CSVフォーマット';
+
+CREATE FILE FORMAT COMMON_DB.FILE_FORMATS.FF_CSV_TSV
+  TYPE = CSV FIELD_DELIMITER = '\t' SKIP_HEADER = 1;
+
+CREATE FILE FORMAT COMMON_DB.FILE_FORMATS.FF_JSON_STANDARD
+  TYPE = JSON STRIP_OUTER_ARRAY = TRUE;
+
+CREATE FILE FORMAT COMMON_DB.FILE_FORMATS.FF_PARQUET
+  TYPE = PARQUET;
+
+
+参照する側は完全修飾名で指定します：
+
+COPY INTO ANALYTICS.RAW.SALES
+FROM @ANALYTICS.STAGES.S3_SALES
+FILE_FORMAT = COMMON_DB.FILE_FORMATS.FF_CSV_STANDARD;
+
+
+これにより、File Formatの実体は1箇所だけになり、NULL_IF や FIELD_DELIMITER の仕様変更も1箇所で完結します。
+権限設計：READER ロールを作る
+共通DBの利用権限を整理するには、専用のアクセスロールを作ります。
+
+-- 共通リソース参照用アクセスロール
+CREATE ROLE COMMON_READER;
+
+GRANT USAGE ON DATABASE COMMON_DB TO ROLE COMMON_READER;
+GRANT USAGE ON SCHEMA COMMON_DB.FILE_FORMATS TO ROLE COMMON_READER;
+GRANT USAGE ON ALL FILE FORMATS IN SCHEMA COMMON_DB.FILE_FORMATS 
+  TO ROLE COMMON_READER;
+GRANT USAGE ON FUTURE FILE FORMATS IN SCHEMA COMMON_DB.FILE_FORMATS 
+  TO ROLE COMMON_READER;
+
+-- 必要な機能ロールすべてに継承
+GRANT ROLE COMMON_READER TO ROLE SVC_LOADER;
+GRANT ROLE COMMON_READER TO ROLE SVC_TRANSFORMER;
+GRANT ROLE COMMON_READER TO ROLE DATA_ENGINEER;
+GRANT ROLE COMMON_READER TO ROLE DEVELOPER;
+
+
+COMMON_READER ロールを「全社共通リソースを使える権利」として独立させると、新しい機能ロールが増えた時もこれを継承させるだけで済みます。
+パターン2：ANALYTICS DB内の共通スキーマ
+別DBを切るほどではない規模なら、分析DB内に共通スキーマを置く方法もあります。
+
+CREATE SCHEMA ANALYTICS._COMMON;  -- アンダースコアで「特殊」を示す
+CREATE SCHEMA ANALYTICS._FILE_FORMATS;
+
+
+スキーマ名にアンダースコアプレフィックスを付けると、SHOW SCHEMASの一覧で先頭に並んで「これは特別なスキーマ」と視覚的に分かります。命名の小技ですが効果的です。
+ただし、本番DBと開発DB（ANALYTICS_PROD / ANALYTICS_DEV）に分けている場合、共通スキーマも各DBに重複して持つことになるので、規模が出てきたらパターン1に移行するのが筋です。
+パターン3：UTILS DB という呼び方
+「COMMON」という名前に抵抗があれば、UTILS_DB、SHARED_DB、META_DB といった命名も実務でよく見ます。意図が伝わる名前なら何でもOKです。
+ただし SHARED はSnowflakeのデータシェアリング機能と紛らわしいので避けた方が無難です。
+File Formatの分類整理
+共通DBに置くFile Formatは、用途別に整理しておくと使う側が迷いません。
+
+-- 型 × 用途で命名
+FF_CSV_STANDARD       -- 標準CSV（カンマ・ヘッダーあり・標準NULL）
+FF_CSV_NO_HEADER      -- ヘッダーなしCSV
+FF_TSV_STANDARD       -- TSV
+FF_JSON_STANDARD      -- 標準JSON
+FF_JSON_NESTED        -- ネストJSON（STRIP_OUTER_ARRAY=FALSE）
+FF_PARQUET            -- Parquet
+FF_AVRO               -- Avro
+FF_XML                -- XML
+
+
+「とりあえずこれを使えば標準」というデフォルト形式（_STANDARD サフィックス）を用意しておくと、新人エンジニアが迷わずに済みます。
+例外的に個別File Formatを作るケース
+「共通化したい」と言っても、全部を共通化するのは無理です。以下のようなケースは個別のスキーマに専用File Formatを置く方が良いです。
+	∙	特定システムからのCSVが特殊なエンコーディング（Shift-JIS、CP932等）
+	∙	特定ベンダーからのデータで区切り文字が独自（パイプ|、@等）
+	∙	レガシーシステムからの固定長フォーマット
+	∙	一時的な調査用の使い捨てフォーマット
+この場合は、共通File Formatに FF_CSV_STANDARD、ベンダー個別に ANALYTICS.RAW.FF_CSV_VENDOR_A_SJIS という構造で共存させます。「迷ったら共通、特殊なら個別」のルールを明文化しておくと運用が楽です。
+Storage Integrationも同じ思想で集約
+Storage Integrationはそもそもアカウントレベルなので集約問題は起きませんが、「どのDBから参照するためのIntegrationか」が紐づくので、命名規約で関係を明示するのが定石です。
+
+-- Storage Integration命名: SI_<用途>_<クラウド>
+CREATE STORAGE INTEGRATION SI_LANDING_S3 ...;       -- 受信用
+CREATE STORAGE INTEGRATION SI_EXPORT_S3 ...;        -- エクスポート用
+CREATE STORAGE INTEGRATION SI_VENDOR_A_S3 ...;      -- 特定ベンダー用
+
+
+これらへのUSAGE権限をどのロールに付けるかは、データの機密度に応じて分けます。
+Stageは共通化しない方が良い
+ここが重要なのですが、File Formatは共通化しやすい一方、Stageは共通化しない方が良いです。理由は：
+	∙	Stageは「どこのS3バケットを指すか」という個別の情報を持つ
+	∙	バケットごとに権限境界が異なる（このバケットはチームAだけ、等）
+	∙	データソースごとにバケット/プレフィックスが違うのが普通
+なのでStageは各データソース単位、もしくは各RAWスキーマ単位で作るのが自然です。
+
+COMMON_DB.FILE_FORMATS.FF_CSV_STANDARD   ← 共通化
+ANALYTICS.RAW.STAGE_SALES_S3              ← 個別（営業データ用）
+ANALYTICS.RAW.STAGE_HR_S3                 ← 個別（人事データ用）
+HR_DB.RAW.STAGE_HR_PRIVATE                ← 個別（機密人事データ用、別DB）
+
+
+「File Formatは仕様、Stageは実体」と捉えると整理しやすいです。仕様は再利用可能、実体は個別、という関係です。
+共通UDFやマスキングポリシーも同じパターン
+実はFile Formatと同じ「スキーマ配下だけど全社共通化したい」課題は、他のオブジェクトでも発生します。
+	∙	共通UDF（独自の日付フォーマット変換、文字列クリーニング等）
+	∙	共通マスキングポリシー（メアド・電話番号・氏名のマスキング）
+	∙	共通Row Access Policy（部門コードでのフィルタリングロジック）
+	∙	共通タグ（PIIタグ、機密度タグ）
+これらもすべて COMMON_DB 配下に集約するのが定石です。
+
+COMMON_DB.FILE_FORMATS.*       -- ファイル形式定義
+COMMON_DB.FUNCTIONS.*          -- 共通UDF
+COMMON_DB.POLICIES.*           -- マスキング・行アクセスポリシー
+COMMON_DB.TAGS.*               -- タグ定義
+
+
+PoCの早い段階で COMMON_DB を作っておくと、後から「あ、これも共通化したかった」となった時に置き場所に困りません。
+クライアントPoC向けの実装ステップ
+池田さんのクライアントPoC向けに、具体的にどう進めるかを段階的に示すと：
+Step 1: COMMON_DB を立てる
+
+CREATE DATABASE COMMON_DB COMMENT = '全社共通リソース集約DB';
+CREATE SCHEMA COMMON_DB.FILE_FORMATS;
+
+
+Step 2: 標準File Formatを定義
+最初はCSV標準とJSON標準だけで十分。必要に応じて追加。
+Step 3: COMMON_READER アクセスロールを作る
+
+CREATE ROLE COMMON_READER 
+  COMMENT = '全社共通リソースの参照権限';
+GRANT USAGE ON DATABASE COMMON_DB TO ROLE COMMON_READER;
+GRANT USAGE ON ALL SCHEMAS IN DATABASE COMMON_DB TO ROLE COMMON_READER;
+GRANT USAGE ON ALL FILE FORMATS IN SCHEMA COMMON_DB.FILE_FORMATS 
+  TO ROLE COMMON_READER;
+GRANT USAGE ON FUTURE FILE FORMATS IN SCHEMA COMMON_DB.FILE_FORMATS 
+  TO ROLE COMMON_READER;
+
+
+Step 4: 全機能ロールに継承させる
+
+GRANT ROLE COMMON_READER TO ROLE SVC_LOADER;
+GRANT ROLE COMMON_READER TO ROLE SVC_TRANSFORMER;
+GRANT ROLE COMMON_READER TO ROLE DEVELOPER;
+GRANT ROLE COMMON_READER TO ROLE ANALYST;
+
+
+Step 5: 利用ガイドラインを文書化
+「新規ロード処理を作る場合は、まず COMMON_DB.FILE_FORMATS のFile Formatで対応可能か確認すること。対応できない特殊フォーマットのみ各スキーマに個別作成可」というルールを明文化。これがないと、結局各人が好き勝手にFile Formatを作って共通化の意味がなくなります。
+まとめ
+	∙	File Formatは物理的にはスキーマ配下、論理的にはアカウント全体共通にできる
+	∙	COMMON_DB.FILE_FORMATS のような集約スキーマを作る
+	∙	COMMON_READER アクセスロールを作って各機能ロールに継承
+	∙	Stageは個別、File Formatは共通、という抽象度の違いで分ける
+	∙	共通UDF・ポリシー・タグも同じパターンで集約できる
+	∙	ガイドラインを文書化して規律ある運用にする
+この構造にしておくと、池田塾でDB設計を教える時にも「論理設計と物理配置の分離」という良い教材になりますね。スキーマというSnowflakeの物理単位を、論理的な「全社共通領域」として再定義する設計判断、と説明できます。
+COMMON_DB 内には他にどんなオブジェクトを置く想定がありそうですか？ UDF（特に日本固有の和暦変換、全角半角統一、郵便番号正規化など）をどう設計するかも、PoCのうちに整理しておくと後の本番展開で効きます。​​​​​​​​​​​​​​​​
+
+
+--------------------------
 いえ、ファイルフォーマットとステージはスキーマ配下のオブジェクトです。DB/スキーマの階層に属するので、テーブルやビューと同じ扱いになります。ロール設計上もこの点を踏まえる必要があります。
 オブジェクトの所属階層
 Snowflakeの主要オブジェクトの所属を整理すると：
