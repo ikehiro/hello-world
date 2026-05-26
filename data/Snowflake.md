@@ -1,6 +1,178 @@
 # Snowflake
 
 
+いえ、ファイルフォーマットとステージはスキーマ配下のオブジェクトです。DB/スキーマの階層に属するので、テーブルやビューと同じ扱いになります。ロール設計上もこの点を踏まえる必要があります。
+オブジェクトの所属階層
+Snowflakeの主要オブジェクトの所属を整理すると：
+アカウント直下
+	∙	Warehouse、Database、User、Role、Network Policy、Resource Monitor、Share
+データベース直下
+	∙	Schema、Database Role
+スキーマ直下
+	∙	Table、View、Stage、File Format、Function、Procedure、Stream、Task、Pipe、Sequence、Masking Policy、Row Access Policy
+つまりFile FormatとStageは <DB>.<SCHEMA>.<OBJECT> の形でフルパス指定する、スキーマレベルのオブジェクトです。
+
+-- 完全修飾名で参照
+COPY INTO ANALYTICS.RAW.SALES
+FROM @ANALYTICS.RAW.S3_STAGE_SALES
+FILE_FORMAT = ANALYTICS.RAW.FF_CSV_STANDARD;
+
+
+ステージの種類による違い
+ステージには3種類あり、所属が異なるので注意です。
+Named Stage（名前付きステージ）
+	∙	スキーマ配下に明示的に作成
+	∙	CREATE STAGE ANALYTICS.RAW.S3_STAGE_SALES ...
+	∙	通常の権限管理対象、ロール設計に組み込むのはこれ
+User Stage（ユーザーステージ）
+	∙	各ユーザーに自動で1つ存在、@~ で参照
+	∙	そのユーザー本人だけがアクセス可能
+	∙	他人に共有不可、ロール設計には組み込まない
+Table Stage（テーブルステージ）
+	∙	各テーブルに自動で1つ存在、@%table_name で参照
+	∙	そのテーブルへの権限を持つロールが利用可能
+	∙	個別の権限管理は不要、テーブル権限に従う
+ELTパイプラインで設計するのは基本的にNamed Stageです。User StageとTable Stageは個人作業やアドホックな用途で使うものなので、本番の権限設計には登場しません。
+ロール設計への組み込み方
+ステージとファイルフォーマットは「どこに配置するか」がロール設計に直結します。配置場所のパターンは3つあります。
+パターンA: 専用スキーマに集約（推奨）
+RAW スキーマ内に「テーブル群」とは別に「ロード用オブジェクト群」を置く、または専用スキーマ STAGES を作る方法。
+
+-- 専用スキーマパターン
+CREATE SCHEMA ANALYTICS.STAGES;
+CREATE SCHEMA ANALYTICS.FILE_FORMATS;
+
+CREATE STAGE ANALYTICS.STAGES.S3_RAW_SALES
+  URL = 's3://...'
+  STORAGE_INTEGRATION = my_s3_int;
+
+CREATE FILE FORMAT ANALYTICS.FILE_FORMATS.FF_CSV_STANDARD
+  TYPE = CSV
+  FIELD_DELIMITER = ','
+  SKIP_HEADER = 1;
+
+
+権限制御は：
+
+-- ロード系アクセスロールに付与
+GRANT USAGE ON SCHEMA ANALYTICS.STAGES TO ROLE ANALYTICS_LOAD_RW;
+GRANT USAGE ON STAGE ANALYTICS.STAGES.S3_RAW_SALES TO ROLE ANALYTICS_LOAD_RW;
+GRANT READ ON STAGE ANALYTICS.STAGES.S3_RAW_SALES TO ROLE ANALYTICS_LOAD_RW;
+
+GRANT USAGE ON SCHEMA ANALYTICS.FILE_FORMATS TO ROLE ANALYTICS_LOAD_RW;
+GRANT USAGE ON FILE FORMAT ANALYTICS.FILE_FORMATS.FF_CSV_STANDARD TO ROLE ANALYTICS_LOAD_RW;
+
+
+メリット：
+	∙	ロード用オブジェクトの集中管理ができる
+	∙	複数のRAWスキーマ（部門別など）で同じFile Formatを共有できる
+	∙	権限管理がシンプル（スキーマ単位でまとめて制御）
+パターンB: RAWスキーマに同居
+ロード先のテーブルと同じスキーマにステージ・ファイルフォーマットを置く方法。
+
+CREATE STAGE ANALYTICS.RAW.S3_STAGE_SALES ...;
+CREATE FILE FORMAT ANALYTICS.RAW.FF_CSV ...;
+CREATE TABLE ANALYTICS.RAW.SALES ...;
+
+
+メリット：
+	∙	関連オブジェクトが1スキーマに集まる
+	∙	アクセスロール ANALYTICS_RAW_RW 1つで全部カバーできる
+デメリット：
+	∙	部門別RAWスキーマがある場合、同じFile Formatを複数スキーマに重複作成することになる
+パターンC: 専用データベースに分離
+大規模環境で、ステージング基盤を独立DBにする方法。
+
+CREATE DATABASE LANDING_DB;
+CREATE SCHEMA LANDING_DB.STAGES;
+CREATE SCHEMA LANDING_DB.FORMATS;
+
+
+データレイク的な使い方や、複数の分析DBに同じソースデータを供給する構造の時に有効です。PoC段階ではオーバーキルです。
+File Formatの共通化価値
+File Formatはスキーマ間で再利用できるので、共通化のメリットが大きいオブジェクトです。
+
+-- 全社共通フォーマットを1箇所に定義
+CREATE FILE FORMAT ANALYTICS.FILE_FORMATS.FF_CSV_STANDARD
+  TYPE = CSV FIELD_DELIMITER = ',' SKIP_HEADER = 1
+  NULL_IF = ('NULL', 'null', '');
+
+CREATE FILE FORMAT ANALYTICS.FILE_FORMATS.FF_JSON_STANDARD
+  TYPE = JSON;
+
+CREATE FILE FORMAT ANALYTICS.FILE_FORMATS.FF_PARQUET
+  TYPE = PARQUET;
+
+
+「NULL扱いをどうするか」「タイムスタンプ形式は何か」といった会社全体のルールをFile Formatに集約しておくと、データ品質のブレを防げます。各ロード処理は共通のFile Formatを参照するだけになります。
+権限的にはこのFile Formatに対して、ロード系ロール全員に USAGE を付与すればOKです。
+ステージへの権限の種類
+ステージは権限の種類がやや特殊です。
+	∙	USAGE: ステージの存在を認識し、参照できる（必須）
+	∙	READ: ステージからの読み取り（外部ステージ・内部ステージ両方）。COPY INTO <table> FROM @stage で必要
+	∙	WRITE: ステージへの書き込み。COPY INTO @stage FROM <table>（アンロード）や PUT コマンドで必要
+ロード処理だけなら USAGE + READ、アンロード処理もするなら USAGE + READ + WRITE です。
+
+-- ロード専用ロール
+GRANT USAGE, READ ON STAGE ANALYTICS.STAGES.S3_RAW_SALES TO ROLE ANALYTICS_LOAD_R;
+
+-- アンロード（データエクスポート）もするロール
+GRANT USAGE, READ, WRITE ON STAGE ANALYTICS.STAGES.S3_EXPORT TO ROLE ANALYTICS_EXPORT_RW;
+
+
+Storage Integrationという別レイヤー
+外部ステージ（S3/Azure Blob/GCS）を使う場合、ステージの背後にStorage Integrationというアカウントレベルオブジェクトがあります。
+
+-- ACCOUNTADMINで作成
+CREATE STORAGE INTEGRATION s3_int
+  TYPE = EXTERNAL_STAGE
+  STORAGE_PROVIDER = 'S3'
+  STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::xxx:role/snowflake-role'
+  STORAGE_ALLOWED_LOCATIONS = ('s3://my-bucket/');
+
+-- 利用するロールにUSAGE付与
+GRANT USAGE ON INTEGRATION s3_int TO ROLE ANALYTICS_LOAD_RW;
+
+
+Storage Integrationはアカウント直下のオブジェクトで、ステージ作成時に参照されます。Integrationへの USAGE 権限もロール設計に組み込む必要があります。これを忘れて「ステージは作れたのにCOPYで失敗する」というハマりがよく発生します。
+FUTURE GRANTSとの組み合わせ
+ファイルフォーマットやステージも FUTURE GRANTS の対象です。専用スキーマパターンを採るなら、これを設定しておくと運用が楽になります。
+
+-- 今後ANALYTICS.STAGESに作成される全ステージへの権限を自動付与
+GRANT USAGE ON FUTURE STAGES IN SCHEMA ANALYTICS.STAGES 
+  TO ROLE ANALYTICS_LOAD_RW;
+GRANT READ ON FUTURE STAGES IN SCHEMA ANALYTICS.STAGES 
+  TO ROLE ANALYTICS_LOAD_RW;
+
+GRANT USAGE ON FUTURE FILE FORMATS IN SCHEMA ANALYTICS.FILE_FORMATS 
+  TO ROLE ANALYTICS_LOAD_RW;
+
+
+PoC向けの推奨構成
+200名規模のクライアントなら、こんな構成がバランス良いです。
+スキーマ構成：
+	∙	ANALYTICS.RAW（生データテーブル）
+	∙	ANALYTICS.STAGING（変換中間テーブル）
+	∙	ANALYTICS.MART（分析用マート）
+	∙	ANALYTICS.STAGES（外部ステージ集約）★追加
+	∙	ANALYTICS.FILE_FORMATS（File Format集約）★追加
+アクセスロールへの権限付与：
+	∙	ANALYTICS_LOAD_RW（ロード用）に STAGES、FILE_FORMATS、RAW のUSAGE/操作権限
+	∙	ANALYTICS_RAW_R（参照用）に RAW のSELECT権限
+	∙	Storage Integration S3_INT のUSAGEは ANALYTICS_LOAD_RW のみ
+機能ロールへの継承：
+	∙	SVC_LOADER → ANALYTICS_LOAD_RW を継承
+	∙	SVC_TRANSFORMER → ANALYTICS_LOAD_RW + ANALYTICS_RAW_R + ANALYTICS_STAGING_RW + ANALYTICS_MART_RW を継承
+これで「ステージとファイルフォーマットはどのロールが触れるか」が明確になり、ELTパイプライン全体の権限が見通しやすくなります。
+まとめ
+	∙	File FormatとStageはスキーマ配下のオブジェクトで、テーブルと同列の扱い
+	∙	権限はスキーマレベルの USAGE + オブジェクトレベルの権限が必要
+	∙	専用スキーマに集約（STAGES、FILE_FORMATS）するパターンが管理しやすい
+	∙	Storage Integrationはアカウントレベルで、別途USAGE付与が必要
+	∙	FUTURE GRANTSで新規オブジェクトへの権限付与を自動化できる
+ステージの設計周りで他に気になるところはありますか？ Snowpipe（自動取り込み）を使う場合、Pipe オブジェクトの権限設計がまた別途必要になるので、その話もできます。​​​​​​​​​​​​​​​​
+
+----------------------------------
 
 # データウェアハウス (DWH) サービスレベル合意書 (SLA) 雛形
 
