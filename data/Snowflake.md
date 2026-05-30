@@ -1,5 +1,123 @@
 # Snowflake
 
+
+Snowflakeとの連携部分のAWSセキュリティ構成として、一般的なものをまとめます。
+
+全体構成イメージ
+
+外部データソース
+    ↓
+[S3バケット] ← データ投入
+    ↓
+[Glue / Lambda / ECS] ← ELT処理
+    ↓
+[Snowflake] ← PrivateLinkで接続
+
+
+1. ネットワーク接続のセキュリティ
+AWS PrivateLink（最重要）
+	∙	SnowflakeへのトラフィックをインターネットNOT経由にする
+	∙	VPC内からSnowflakeエンドポイントに直接接続
+	∙	池田さんが設計されているようなIP制限と組み合わせると二重防御になる
+
+VPC → VPCエンドポイント → Snowflake PrivateLink
+
+
+セキュリティグループ設定
+	∙	ECS/Glue/LambdaのアウトバウンドをSnowflakeのPrivateLinkエンドポイントのみ許可
+	∙	不要なアウトバウンドは全拒否
+
+2. 認証情報管理
+AWS Secrets Manager（定番）
+
+Lambda/ECS/Glue
+→ Secrets Managerからクレデンシャル取得
+→ Snowflakeに接続
+
+
+	∙	Snowflakeのユーザー名・パスワード・アカウント識別子を保存
+	∙	自動ローテーション設定推奨
+	∙	ハードコード厳禁
+キーペア認証（より推奨）
+	∙	パスワードの代わりにRSAキーペアでSnowflake認証
+	∙	秘密鍵をSecrets ManagerまたはSSM Parameter Storeに保存
+	∙	パスワードレスで漏洩リスクを下げられる
+
+3. IAMの設計
+Snowflake Storage Integration用IAMロール
+
+S3 → Snowflake External Stage構成の場合：
+
+IAMロール（Snowflakeが引き受ける）
+  └ S3バケットへのGetObject/ListBucket権限のみ付与
+  └ 信頼ポリシーにSnowflakeアカウントARNを指定
+
+
+ELT処理側のIAMロール
+
+ECSタスクロール / Lambda実行ロール
+  └ Secrets Managerへのアクセス権限
+  └ S3への必要最小限の権限
+  └ CloudWatch Logsへの書き込み権限
+
+
+最小権限の原則を徹底することが重要です。
+
+4. データ転送のセキュリティ
+S3バケット設定
+	∙	パブリックアクセス完全ブロック
+	∙	SSE-S3またはSSE-KMSで暗号化
+	∙	バケットポリシーでSnowflake Storage IntegrationのIAMロールのみ許可
+	∙	アクセスログ有効化
+KMS（推奨）
+
+S3暗号化キー → AWS KMS管理
+Secrets Managerの暗号化 → KMS
+
+
+	∙	キーポリシーで利用者を厳密に制限
+
+5. 監視・検知
+CloudTrail
+	∙	S3へのアクセスログ
+	∙	Secrets Managerへのアクセスログ
+	∙	IAMロールのAssumeRoleログ
+GuardDuty
+	∙	Snowflake接続元の異常な通信検知
+	∙	認証情報の不正利用検知
+Macie
+	∙	S3の機密データ混入チェック
+	∙	Snowflakeにロードする前に個人情報を検出
+CloudWatch
+	∙	ELTジョブのエラー監視
+	∙	異常なデータ転送量のアラート
+
+6. 全体セキュリティレイヤーまとめ
+
+
+
+|レイヤー  |使うサービス                               |
+|------|-------------------------------------|
+|ネットワーク|PrivateLink・セキュリティグループ・VPC           |
+|認証情報  |Secrets Manager・キーペア認証               |
+|アクセス制御|IAMロール最小権限・バケットポリシー                  |
+|暗号化   |KMS・S3暗号化・TLS通信                      |
+|監視・検知 |CloudTrail・GuardDuty・Macie・CloudWatch|
+|集約管理  |Security Hub                         |
+
+池田さんの設計文脈で特に重要な点
+ELTサービスアカウント設計やSnowflakeのロール階層を既に検討されているので、AWS側との対応関係を意識すると整合性が取りやすいです。
+
+Snowflakeロール階層          AWS側
+─────────────────────────────────────
+SYSADMIN配下のELTロール  ↔  ECSタスクロール / Glue IAMロール
+LOADER専用ロール         ↔  S3 Storage Integration IAMロール
+監査ロール              ↔  CloudTrail + Security Hub
+
+
+この対応関係をPoC文書に落とし込むと、クライアントへの説明がかなりしやすくなると思います。​​​​​​​​​​​​​​​​
+
+-------------------------/
 Macie 設定ガイド
 
 必須設定
