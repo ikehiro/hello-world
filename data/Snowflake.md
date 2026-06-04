@@ -1,6 +1,48 @@
 # Snowflake
 
+はい、秘密鍵を AWS Secrets Manager で管理して問題ありません。むしろ、EC2やLambdaの環境変数、Git、S3平置きより安全です。
 
+ただし注意点があります。
+
+注意点
+	1.	KMSはカスタマー管理キー推奨
+デフォルトの aws/secretsmanager でも暗号化されますが、重要な秘密鍵なら Customer Managed KMS Key を使う方が、権限・監査・無効化を細かく制御できます。Secrets Manager はKMSのデータキーでシークレット値を暗号化します。 ￼
+	2.	IAM権限は最小化
+アプリには以下だけを許可するのが基本です。
+
+{
+  "Effect": "Allow",
+  "Action": "secretsmanager:GetSecretValue",
+  "Resource": "arn:aws:secretsmanager:ap-northeast-1:xxxx:secret:your-secret-*"
+}
+
+KMSを独自キーにする場合は、該当ロールに kms:Decrypt も必要です。
+
+	3.	秘密鍵をログに出さない
+取得後に print(secret)、例外ログ、CloudWatch Logs、CIログに出る事故が多いです。
+特に秘密鍵は改行入りなので、デバッグ出力に注意です。
+	4.	Terraformで登録する場合は tfstate に残る
+aws_secretsmanager_secret_version.secret_string に秘密鍵を直接書くと、Terraform state に平文相当で残る可能性があります。AWSもTerraform stateの機密情報リスクを注意喚起しています。 ￼
+可能なら初回投入はCLIや手動、またはCIの安全なシークレット経由にします。
+	5.	ローテーション設計
+DBパスワードと違い、秘密鍵は自動ローテーションが難しいことがあります。
+使い先、公開鍵の差し替え、接続先の許可登録まで含めて「新旧併用期間」を設計します。
+	6.	Lambda/VPCから使うならVPCエンドポイント
+LambdaがVPC内でインターネットに出られない構成なら、Secrets Manager の VPC エンドポイントを作るのが推奨です。 ￼
+
+おすすめ構成
+
+秘密鍵をSecrets Managerに保存
+→ KMSはCustomer Managed Key
+→ アプリのIAMロールだけ GetSecretValue + kms:Decrypt
+→ CloudTrailで取得履歴を監査
+→ Terraform stateには秘密鍵を入れない
+
+結論として、管理場所としてはSecrets ManagerでOKです。
+一番のリスクは「保存先」よりも、取得できるIAMロールが広すぎることとログ・tfstateへの漏洩です。
+
+
+------------------------
 結論から言うと、名寄せの精度と運用次第ですが、多くの場合は簡易的な画面があった方が良いです。
 
 画面が不要なケース
