@@ -1,5 +1,368 @@
 # Snowflake
 
+池田さんの案、方向性として正しいです。本番がSnowflake内のdbt projectで動くなら、CIはむしろ「本番と環境を分ける」必要があるので、その判断は理にかなっています。
+ただし、いくつか論点があります。整理しますね。
+池田さんの案の評価
+「PR単位でエフェメラルDB + Docker上のdbt」案を分解すると:
+
+[GitBucket PR]
+   ↓
+[Docker (CI Runner)] - dbt-core 起動
+   ↓
+[Snowflake] - PR単位の一時DB (PR_123_DB) を作って検証
+   ↓
+[PR closeで一時DBを削除]
+
+
+良い点:
+	∙	PRごとの完全分離: スキーマ単位ではなくDB単位で分けるので、ロール権限・Snowpipe・Stream等の検証も完結する
+	∙	本番と環境の分離: 本番がSnowflake内のdbt projectでもCIはDockerで独立、デバッグしやすい
+	∙	dbt-core が手元で再現可能: Dockerなら開発者ローカルでも同じイメージで再現できる
+気になる点:
+	∙	エフェメラル”DB”の作成コストが地味に重い: スキーマ作成は瞬時だがDB作成はメタデータ操作多め
+	∙	データのコピー戦略が未定義: 空DBだとtest通っても意味薄い、本番からclone必要
+	∙	Snowpipe等の連携リソースはDBごとに作り直すのか?
+	∙	本番と実行エンジンが違う (Docker dbt-core vs Snowflake内dbt) ことによる挙動差リスク
+CIの選択肢を整理
+選択肢A: PR単位エフェメラルDB + Docker dbt-core (池田さん案)
+
+PR_123_DB (zero-copy clone from PROD_DB)
+  ├─ RAW
+  ├─ STG  
+  └─ MART
+
+
+
+
+|評価項目   |コメント                                          |
+|-------|----------------------------------------------|
+|分離度    |★★★★★ DBごと完全分離                                |
+|本番との挙動差|★★★ Dockerと本番(Snowflake dbt project)で実行エンジンが違う|
+|コスト    |★★★ DBクローンはzero-copyなのでストレージは安い、計算リソースは普通     |
+|クリーンアップ|★★★ DBごとDROPで一発                               |
+|実装難易度  |★★★ Dockerfile + cleanup macro必要              |
+
+選択肢B: PR単位エフェメラルスキーマ + Docker dbt-core (bruno-szdl式)
+
+CI_DB
+  ├─ PR_123__abc__staging
+  ├─ PR_123__abc__marts
+  └─ PR_456__def__staging
+
+
+
+
+|評価項目   |コメント                                      |
+|-------|------------------------------------------|
+|分離度    |★★★★ スキーマレベルで分離、十分実用                      |
+|本番との挙動差|★★★ 同上                                    |
+|コスト    |★★★★ スキーマ作成は軽量                            |
+|クリーンアップ|★★★★ generate_schema_name + drop macroで自動化|
+|実装難易度  |★★ 前回作った構成そのまま                            |
+
+選択肢C: PR単位エフェメラルDB + Snowflake内 dbt project (本番と同じ実行エンジン)
+
+[GitBucket PR]
+   ↓
+[GitBucket CI Plugin] が Snowflakeに API call
+   ↓
+[Snowflake内に CI用 dbt project 作成]
+   ↓
+EXECUTE DBT PROJECT pr_123_project ARGS='build --target ci';
+
+
+
+
+|評価項目   |コメント                                      |
+|-------|------------------------------------------|
+|分離度    |★★★★★ DBごと分離                              |
+|本番との挙動差|★★★★★ 実行エンジンが本番と同じ                        |
+|コスト    |★★★★ Docker runner不要、Snowflakeクレジットのみ     |
+|クリーンアップ|★★★★ DBごとDROP                             |
+|実装難易度  |★★★★ Snowflake dbt projects機能の習熟必要、まだ新しい機能|
+
+選択肢D: dbt Cloud CI (商用)
+
+
+
+|評価項目   |コメント     |
+|-------|---------|
+|分離度    |★★★★     |
+|本番との挙動差|★★★      |
+|コスト    |★ ライセンス費用|
+|クリーンアップ|★★★★★ 全自動|
+|実装難易度  |★ 設定だけ   |
+
+私の推奨: 選択肢C (本番と同じ実行エンジン)
+ただし条件付きです。整理すると:
+おすすめ順序
+第1位: 選択肢C (Snowflake内 dbt project でCI)
+理由:
+	∙	本番と同じ実行エンジンなのが最大のメリット。CI通って本番で落ちる事故が激減
+	∙	Snowflake内で完結するのでDocker runnerやNAT GWやVPCの設計不要
+	∙	dbt projects on SnowflakeのEXECUTE DBT PROJECT でテスト走らせるだけ
+	∙	池田さんがすでにSnowflake寄りに本番アーキを倒しているので一貫性がある
+懸念:
+	∙	dbt projects on Snowflake はまだ比較的新しい機能。Public Preview / GAステータスを確認する必要あり
+	∙	ロールバック設計やdbt CLIオプションの互換性は要検証
+第2位: 選択肢A (池田さん案) ← もし選択肢Cが時期尚早ならこちら
+理由:
+	∙	DB単位分離は確かにスキーマ分離より清く、Snowpipeやステージ等のリソース検証も含められる
+	∙	Dockerで実行することで開発者ローカル再現性が確保できる
+第3位: 選択肢B (bruno-szdl式) ← シンプルさ重視ならこれ
+理由:
+	∙	前回作った構成そのまま使える
+	∙	スキーマ分離で実用上ほぼ困らない
+	∙	DBクローンの待ち時間 (数秒〜数十秒) も不要
+池田さん案 (選択肢A) を採用するなら、押さえるべきポイント5つ
+選択肢Aで進める場合の、実装上の論点です。
+1. データのコピー戦略
+空DBでtestを走らせても意味が薄いので、本番からzero-copy cloneするのが定石:
+
+-- PR作成時
+CREATE DATABASE PR_123_DB CLONE PROD_DB;
+GRANT USAGE ON DATABASE PR_123_DB TO ROLE CI_ROLE;
+
+
+zero-copyなのでストレージコストは差分のみ、作成時間も数秒。
+2. CI用ロールの権限設計
+PR_123_DBへのCREATE/DROP/MODIFY権限を持つCI_ROLEを用意。本番DBへはSELECT権限のみ(--defer時の参照用) に絞る。
+3. クリーンアップの確実性
+PR closeをトリガーに削除するが、GitBucket CI Pluginのclose event取り逃しに備えて、毎週バッチで「7日以上前のPR_*_DB」を削除する保険を入れておく:
+
+-- 毎週日曜実行
+EXECUTE TASK weekly_pr_cleanup;
+-- 内部で SHOW DATABASES → 7日以上前のPR_*をDROP
+
+
+4. 本番との挙動差リスクの軽減
+Docker dbt-coreと本番のSnowflake dbt projectでdbtバージョンを必ず揃える。CIで通って本番で落ちる事故の8割はバージョン不一致です。
+5. CI実行時間の管理
+DBクローン + dbt build + cleanup で、1 PRあたり数分〜10数分を目安に。これより長くなるなら state:modified+ で差分実行 (Slim CI) を必ず入れる。
+ハイブリッド推奨: 「段階的に選択肢C へ」
+実は一番現実的なのはこれです:
+
+Phase 1 (今): 選択肢A (池田さん案) で実装
+  ↓
+Phase 2 (3-6ヶ月後): dbt projects on Snowflake が安定したら選択肢Cへ移行
+
+
+Phase 1のDocker dbt-core 経験値は無駄になりません:
+	∙	開発者ローカル環境にそのまま転用可能
+	∙	CIロジックの設計 (PR用DB命名、クリーンアップ、状態管理) はそのまま Phase 2 で流用できる
+	∙	Snowflake dbt projects の不確実性をPhase 1で吸収
+まとめ
+池田さん案 (PR単位エフェメラルDB + Docker dbt-core) は理にかなっています。スキーマ分離より一段強い隔離が得られ、Snowpipe等の検証もしやすい。
+ただし、本番が Snowflake 内 dbt project なら、いずれは選択肢C (Snowflake内CI) に倒すと、実行エンジン差異リスクが消えて綺麗です。
+確認したいこと:
+	∙	本番の Snowflake dbt projects は既に動いていますか? それともこれから?
+	∙	CI実行頻度の想定は? (1日数PR? 数十PR?)
+	∙	本番DBのサイズ感は? (zero-copy clone前提でも、ストレージ差分が増えると効いてくる)
+これが分かると、Phase 1の具体実装まで詰められます。​​​​​​​​​​​​​​​​
+
+はい、できます。それどころか別の場所に分けるのが必須です。本番と同じ場所にCI用プロジェクトを置くと事故の元なので、明確に分離します。
+ただし、dbt projects on Snowflake は比較的新しい機能なので、最新の実装方法を確認させてください。​​​​​​​​​​​​​​​​
+
+重要な情報が取れました。dbt Projects on Snowflake は2025年11月にGAになっています。本番運用に乗せられるステータスです。
+これを踏まえて回答します。
+結論: 別の場所に分けられる、むしろそれが標準パターン
+dbt projects on Snowflakeでは、CREATE DBT PROJECT は名前付きのデータベースとスキーマに dbt project object を作成します (例: mydb.my_schema.my_project) ￼。
+つまりdbt project object はスキーマレベルのオブジェクトであり、テーブルやビューと同じように好きな場所に置けます。
+分離の3レベル
+dbt project object と、それが書き込む対象データベースは別物であることがポイント。3つの場所が登場します:
+
+[1] プロジェクト定義 (DBT PROJECT object) の置き場所
+[2] dbt deps で使う dbt_packages の置き場所  
+[3] モデルが書き込む先のデータベース・スキーマ
+
+
+これらをすべて環境ごとに分離するのが基本パターンです。
+推奨構成: 完全分離パターン
+
+┌─ 本番環境 ──────────────────────────────────┐
+│ PROD_DBT_DB.deployments.dbt_proj_prod      │  ← DBT PROJECT object
+│         ↓ writes to                          │
+│ PROD_DB.{raw, staging, marts}              │  ← データの実体
+└─────────────────────────────────────────────┘
+
+┌─ CI環境 (PR単位) ───────────────────────────┐
+│ CI_DBT_DB.deployments.dbt_proj_pr_123      │  ← PRごとに作る
+│         ↓ writes to                          │
+│ PR_123_DB.{raw, staging, marts}            │  ← PRごとのDB
+└─────────────────────────────────────────────┘
+
+
+具体的なやり方
+1. 本番側のセットアップ (一度だけ)
+
+-- 本番のdbt projectオブジェクト置き場
+CREATE DATABASE PROD_DBT_DB;
+CREATE SCHEMA PROD_DBT_DB.deployments;
+
+-- 本番データの置き場
+CREATE DATABASE PROD_DB;
+CREATE SCHEMA PROD_DB.raw;
+CREATE SCHEMA PROD_DB.staging;
+CREATE SCHEMA PROD_DB.marts;
+
+-- Git連携用のAPI integration (一度作れば使い回し)
+CREATE OR REPLACE API INTEGRATION gitbucket_api_integration
+  API_PROVIDER = git_https_api
+  API_ALLOWED_PREFIXES = ('https://gitbucket.example.com/ikeda/')
+  ALLOWED_AUTHENTICATION_SECRETS = (gitbucket_secret)
+  ENABLED = true;
+
+CREATE OR REPLACE GIT REPOSITORY dbt_repo
+  API_INTEGRATION = gitbucket_api_integration
+  GIT_CREDENTIALS = gitbucket_secret
+  ORIGIN = 'https://gitbucket.example.com/ikeda/dbt-project.git';
+
+-- 本番dbt projectをデプロイ (mainブランチから)
+ALTER GIT REPOSITORY dbt_repo FETCH;
+
+CREATE OR REPLACE DBT PROJECT PROD_DBT_DB.deployments.dbt_proj_prod
+  FROM '@dbt_repo/branches/main/'
+  COMMENT = '本番用dbtプロジェクト';
+
+
+profiles.yml の prod targetが PROD_DB を指していれば、 EXECUTE DBT PROJECT ... ARGS='build --target prod' で本番DBに書き込みます。
+2. CI側のセットアップ (PR作成時に動的)
+ここがポイント。PRごとに以下が走るイメージ:
+
+-- (a) PR用データDBを本番からzero-copy clone
+CREATE DATABASE PR_123_DB CLONE PROD_DB;
+
+-- (b) PR用のDBT PROJECT objectを別スキーマに作る
+CREATE OR REPLACE DBT PROJECT CI_DBT_DB.pr_objects.dbt_proj_pr_123
+  FROM '@dbt_repo/branches/pr-123/'
+  COMMENT = 'PR #123 CI用';
+
+-- (c) PR用targetでビルド (profiles.yml にciターゲットを定義しておく)
+EXECUTE DBT PROJECT CI_DBT_DB.pr_objects.dbt_proj_pr_123 
+  ARGS='build --target ci --vars "{pr_database: PR_123_DB}"';
+
+-- (d) PR closeで全削除
+DROP DBT PROJECT CI_DBT_DB.pr_objects.dbt_proj_pr_123;
+DROP DATABASE PR_123_DB;
+
+
+3. profiles.yml で target を切り分け
+
+snowflake:
+  outputs:
+    prod:
+      type: snowflake
+      database: PROD_DB                # 本番データ書き込み先
+      schema: marts
+      # ...
+    
+    ci:
+      type: snowflake
+      database: "{{ var('pr_database') }}"  # PR_123_DB が変数で渡される
+      schema: marts
+      # ...
+
+
+CI実行をどこから引き金にするか
+ここで選択肢が分岐します。
+選択肢C-1: Snowflake CLI (推奨) ⭐
+dbt projects on Snowflakeは、GitHub Actionsなどのツールを通じて、Snowflake CLIによるデプロイメントとテストのCI/CD管理に完全に対応している ￼とのこと。GitBucket CI PluginからもSnowflake CLIを叩けば同じことができます。
+
+# GitBucket CI Pluginから呼ばれるci.sh
+#!/bin/bash
+PR_NUMBER=${CI_PULL_REQUEST_ID}
+
+# Snowflake CLI でdeploy
+snow dbt deploy dbt_proj_pr_${PR_NUMBER} \
+  --database CI_DBT_DB \
+  --schema pr_objects \
+  --source-path ./
+
+# Snowflake CLI でexecute
+snow dbt execute dbt_proj_pr_${PR_NUMBER} \
+  --database CI_DBT_DB \
+  --schema pr_objects \
+  --args "build --target ci --vars '{pr_database: PR_${PR_NUMBER}_DB}'"
+
+
+メリット: 完全にCI環境がSnowflake CLIで標準化される。本番デプロイも同じCLIを使うので一貫性◎
+選択肢C-2: SQL直接実行
+
+# GitBucket CI Pluginから snowsql で SQL を叩く
+snowsql -c ci_connection -q "
+  CREATE DATABASE PR_${PR_NUMBER}_DB CLONE PROD_DB;
+  CREATE OR REPLACE DBT PROJECT CI_DBT_DB.pr_objects.dbt_proj_pr_${PR_NUMBER}
+    FROM '@dbt_repo/branches/pr-${PR_NUMBER}/';
+  EXECUTE DBT PROJECT CI_DBT_DB.pr_objects.dbt_proj_pr_${PR_NUMBER}
+    ARGS='build --target ci --vars \"{pr_database: PR_${PR_NUMBER}_DB}\"';
+"
+
+
+メリット: snowsqlだけで完結、依存少ないデメリット: エラーハンドリング・ログ取得が煩雑
+重要な留意点
+1. dbt project object のバージョン管理
+dbt Project errors (compile or test failures) はquery failuresとして表示され、tasksや他のオーケストレーションツールでハンドリングしやすくなりました。SYSTEM$get_dbt_log(’<query_id>’)で詳細なログが見られます ￼。
+つまりEXECUTE DBT PROJECT の戻り値 = クエリ成否 = CI/CDの判定に直結します。これでCIの成功/失敗判定がシンプルになりました。
+2. dbt deps の扱い
+deployコマンドやupdateコマンドで EXTERNAL_ACCESS_INTEGRATIONS=[…ext] を設定することで、deployment時にdbt depsを実行してプロジェクト依存をインストールできます。これにより、外部依存があるプロジェクトをデプロイする際に /dbt_packages を含める必要がなくなりました ￼。
+これで packages.yml で外部パッケージを使うプロジェクトもスムーズにCIに乗せられます。
+3. クリーンアップ
+
+-- PR close時のクリーンアップ
+DROP DBT PROJECT IF EXISTS CI_DBT_DB.pr_objects.dbt_proj_pr_${PR_NUMBER};
+DROP DATABASE IF EXISTS PR_${PR_NUMBER}_DB;
+
+
+念のため週次バッチで「7日以上前のPR_*」を一括削除する保険を入れておく。
+池田さんの構成での全体像
+
+[GitBucket - PR #123 created]
+       ↓
+[GitBucket CI Plugin (.gitbucket/ci.yml)]
+       ↓ Docker container (snowflake-cli入り) を起動
+       ↓
+[snow CLI が Snowflake にAPI call]
+       ↓
+[Snowflake内]
+  ├─ DB Clone:        PR_123_DB ← PROD_DB
+  ├─ DBT PROJECT作成:  CI_DBT_DB.pr_objects.dbt_proj_pr_123
+  ├─ Execute:         build --target ci  
+  └─ 成否を query result で返却
+       ↓
+[GitBucket PR にステータス反映]
+
+[PR closed]
+       ↓
+[GitBucket CI Plugin (.gitbucket/teardown.yml)]
+       ↓
+[snow CLI で DROP]
+  ├─ DROP DBT PROJECT
+  └─ DROP DATABASE
+
+
+池田さんの当初案 (Docker dbt-core) との比較
+
+
+
+|観点           |Docker dbt-core       |Snowflake内 dbt project (C-1)                  |
+|-------------|----------------------|----------------------------------------------|
+|本番との挙動差      |dbtバージョン差・接続方式差リスク    |**完全に同じ実行エンジン**                               |
+|Docker runner|必要                    |snow CLI動くだけで良い (極小コンテナでOK)                   |
+|ネットワーク経路     |NAT GW + Snowflake許可IP|Snowflake CLI → SF API (パブリック)                |
+|dbt実行ログ      |Docker stdout         |Snowflake Query History + `SYSTEM$get_dbt_log`|
+|並列実行         |Docker側で制御            |Snowflakeのconcurrency制御                       |
+|デバッグ         |ローカル再現容易              |Snowsightで実行履歴確認                              |
+
+まとめ
+できます。むしろ別々の場所が標準パターンです。
+3つの分離レベル(プロジェクト定義の場所、データ書き込み先、dbt_packages置き場)をすべてCI/本番で分離するのが定石。GAされたばかりなので、これから池田さんがクライアントPoCで導入されるなら、選択肢C-1 (Snowflake CLI経由) が最も筋が良いです。
+確認したいこと:
+	∙	本番環境はSnowflake Enterprise Edition以上ですか? (dbt projects GA機能の前提)
+	∙	GitBucketからSnowflake API integrationの設定権限は取れそうですか?
+	∙	既存のSnowflakeアカウントのリージョン制約はありますか?
+次に進むなら、選択肢C-1の具体実装 (snow CLIを使ったci.sh、profiles.yml、teardown.sh) を書き起こせます。やりますか?​​​​​​​​​​​​​​​​
+------
+
 はい、秘密鍵を AWS Secrets Manager で管理して問題ありません。むしろ、EC2やLambdaの環境変数、Git、S3平置きより安全です。
 
 ただし注意点があります。
