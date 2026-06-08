@@ -1,5 +1,162 @@
 # Snowflake
 
+# 設計書: dbt CI on Snowflake Native
+
+## 1. 目的
+
+GitBucket管理のdbtプロジェクトを、本番はSnowflake内のdbt project objectで実行する。CIはPR単位で完全分離された環境で検証する。
+
+## 2. 全体像
+
+```
+[開発者]
+   │ git push (PR作成)
+   ↓
+[GitBucket]
+   │ webhook
+   ↓
+[GitBucket CI Plugin]
+   │ docker run (snow CLI入りコンテナ)
+   ↓
+[ci.sh]
+   ├─ CREATE DATABASE PR_<番号>_DB CLONE PROD_DB
+   ├─ CREATE OR REPLACE DBT PROJECT CI_DBT_DB.PR_OBJECTS.dbt_proj_pr_<番号>
+   ├─ EXECUTE DBT PROJECT ... ARGS='build --target ci'
+   └─ SYSTEM$GET_DBT_LOG でログ取得
+   ↓
+[Snowflake内で全実行]
+   │
+   ↓
+[PR ステータス反映]
+
+──────────────────────────────────────────
+
+[main マージ]
+   ↓
+[deploy_prod.sh]
+   ├─ ALTER GIT REPOSITORY ... FETCH (main最新化)
+   └─ CREATE OR REPLACE DBT PROJECT PROD_DBT_DB.DEPLOYMENTS.DBT_PROJ_PROD
+   ↓
+[本番Task が定期実行]
+   └─ EXECUTE DBT PROJECT ... ARGS='build --target prod'
+```
+
+## 3. オブジェクト配置
+
+### 本番側
+
+|オブジェクト            |場所                                         |役割         |
+|------------------|-------------------------------------------|-----------|
+|データ実体             |`PROD_DB.{raw, staging, marts}`            |本番データ      |
+|dbt project object|`PROD_DBT_DB.DEPLOYMENTS.DBT_PROJ_PROD`    |本番プロジェクト定義 |
+|Git Repository    |`PROD_DBT_DB.INTEGRATIONS.DBT_REPO`        |GitBucket連携|
+|API Integration   |`gitbucket_api_integration`                |アカウント全体で共有 |
+|External Access   |`dbt_packages_eai`                         |dbt deps用  |
+|Task              |`PROD_DBT_DB.DEPLOYMENTS.DBT_PROD_RUN/TEST`|定期実行       |
+
+### CI側
+
+|オブジェクト        |場所                                          |役割                      |
+|--------------|--------------------------------------------|------------------------|
+|PR用データ        |`PR_<番号>_DB` (動的)                           |PROD_DBからzero-copy clone|
+|PR用dbt project|`CI_DBT_DB.PR_OBJECTS.DBT_PROJ_PR_<番号>` (動的)|PR検証用定義                 |
+
+## 4. ロール体系
+
+```
+ACCOUNTADMIN ── SECURITYADMIN
+              │
+              ├── DBT_PROD_ROLE (functional)
+              │     ├── PROD_DB_RW (access)
+              │     └── PROD_DBT_DB_RW (access)
+              │
+              └── CI_ROLE (functional)
+                    ├── CI_DBT_DB全権
+                    ├── CREATE DATABASE on ACCOUNT (PR_*_DB作成用)
+                    └── PROD_DB SELECT (defer用)
+```
+
+## 5. データの動き
+
+### 本番
+
+```
+PROD_DB.raw           ← Snowpipe等で取り込み
+  ↓ stg models
+PROD_DB.staging       ← dbt build (target=prod)
+  ↓ mart models
+PROD_DB.marts         ← dbt build (target=prod)
+```
+
+### CI
+
+```
+PROD_DB (clone source)
+  ↓ CLONE
+PR_123_DB.raw
+PR_123_DB.staging     ← dbt build (target=ci, target_database=PR_123_DB)
+PR_123_DB.marts       ← dbt build (target=ci, target_database=PR_123_DB)
+```
+
+zero-copy cloneなので、未変更データはストレージを共有。CI実行で**変更されたデータのみ**追加コスト発生。
+
+## 6. profiles.yml の target切替
+
+CI実行時:
+
+```sql
+EXECUTE DBT PROJECT ... 
+  ARGS='build --target ci --vars "{target_database: PR_123_DB, pr_number: 123}"';
+```
+
+dbtは `--target ci` で profiles.yml の `ci` ブロックを読む。そこで `database: "{{ var('target_database') }}"` と定義されているので、 `PR_123_DB` が書き込み先になる。
+
+本番実行時:
+
+```sql
+EXECUTE DBT PROJECT ... ARGS='build --target prod';
+```
+
+`--target prod` で profiles.yml の `prod` ブロック (`database: PROD_DB`) が使われる。
+
+## 7. なぜこの構成が筋が良いか
+
+1. **実行エンジンが本番と完全に同じ**
+- CIで通って本番で落ちる事故が原理的に起きにくい
+1. **Docker dbt-coreが不要**
+- CI runnerは `snow` CLI を叩くだけの極小コンテナ
+- dbt-core本体のバージョン管理から解放される
+1. **ネットワーク経路が単純**
+- GitBucket → Snowflake API (HTTPS)
+- VPC、NAT GW、PrivateLink等の検討不要 (CIに関しては)
+1. **クリーンアップが確実**
+- DROP DATABASE と DROP DBT PROJECT の2つで全消去
+- 残骸が発生しにくい
+1. **ログがSnowflake側に集約**
+- `SYSTEM$GET_DBT_LOG(query_id)` で取得可能
+- Query Historyから検索可能
+
+## 8. 既知の制約と対策
+
+|制約                                         |対策                   |
+|-------------------------------------------|---------------------|
+|dbt projects on Snowflake は2025年11月GA、新しい機能|リリースノートを継続ウォッチ       |
+|`EXECUTE DBT PROJECT` の戻り値仕様変更があった         |最新ドキュメントで挙動確認        |
+|GitBucketのPR close eventがCI Pluginで取れない可能性 |週次バッチでPR_*_DBの掃除を別途実装|
+|zero-copy cloneとはいえ巨大DBは作成が遅い              |必要なスキーマだけcloneする選択肢も |
+
+## 9. 進め方 (Phase別)
+
+|Phase|内容        |該当ファイル                                                                |
+|-----|----------|----------------------------------------------------------------------|
+|0    |設計確定      |本文書                                                                   |
+|1    |本番骨格      |`snowflake_setup/01-04`, `scripts/deploy_prod.sh`                     |
+|2    |CI構築      |`snowflake_setup/05-06`, `scripts/ci.sh`, `teardown.sh`, `.gitbucket/`|
+|3    |オーケストレーション|`scripts/create_prod_task.sql`                                        |
+|4    |運用最適化     |(Slim CI, dbt-project-evaluator等を順次追加)                                |
+
+**Phase 1 → Phase 2 の順序は厳守**。本番の輪郭が決まってからCIに着手する。
+--------------
 # dbt CI on Snowflake Native (選択肢C-1)
 
 本番が **Snowflake内 dbt project (`EXECUTE DBT PROJECT`)** で動く前提のCI実装。
