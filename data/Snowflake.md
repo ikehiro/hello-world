@@ -1,5 +1,104 @@
 # Snowflake
 
+# dbt CI on Snowflake Native (選択肢C-1)
+
+本番が **Snowflake内 dbt project (`EXECUTE DBT PROJECT`)** で動く前提のCI実装。
+GitBucket CI Plugin から Snowflake CLI (`snow`) を呼び、PR単位で**完全分離されたエフェメラル環境**でCIを実行する。
+
+## 進め方の推奨フェーズ
+
+|Phase|内容        |期間目安|本ディレクトリでの対応箇所                                                 |
+|-----|----------|----|--------------------------------------------------------------|
+|0    |設計確定      |1-2週|docs/architecture.md                                          |
+|1    |本番骨格構築    |2-3週|snowflake_setup/01-04, dbt_project/, scripts/deploy_prod.sh   |
+|2    |CI構築      |2-3週|snowflake_setup/05-06, .gitbucket/, scripts/ci.sh, teardown.sh|
+|3    |オーケストレーション|1-2週|scripts/create_prod_task.sql                                  |
+|4    |運用最適化     |継続  |(slim CI化、監視、ドキュメント等)                                         |
+
+**必ず Phase 1 → Phase 2 の順で進める**。本番が決まらないとCIの前提が定まらない。
+
+## ディレクトリ構成
+
+```
+.
+├── README.md
+├── snowflake_setup/
+│   ├── 01_prod_database.sql          # Phase 1: 本番DB/スキーマ
+│   ├── 02_prod_roles_and_users.sql   # Phase 1: 本番ロール体系
+│   ├── 03_git_integration.sql        # Phase 1: GitBucket連携
+│   ├── 04_external_access.sql        # Phase 1: dbt deps用外部アクセス
+│   ├── 05_ci_database.sql            # Phase 2: CI用環境
+│   └── 06_ci_roles.sql               # Phase 2: CI_ROLE
+├── dbt_project/
+│   ├── dbt_project.yml
+│   ├── profiles.yml                  # prod / ci の両target定義
+│   ├── packages.yml
+│   ├── models/...
+│   ├── macros/
+│   │   ├── generate_database_name.sql  # CI時に動的DB切替
+│   │   └── drop_pr_resources.sql
+│   └── seeds/
+├── scripts/
+│   ├── deploy_prod.sh                # Phase 1: 本番デプロイ
+│   ├── ci.sh                         # Phase 2: CI実行 (GitBucket CIから呼ばれる)
+│   ├── teardown.sh                   # Phase 2: PR close時のクリーンアップ
+│   └── create_prod_task.sql          # Phase 3: 定期実行Task
+├── docker/
+│   └── Dockerfile                    # snow CLI入りの極小イメージ
+├── .gitbucket/
+│   ├── ci.yml                        # Phase 2: PR時のCIトリガー
+│   └── teardown.yml                  # Phase 2: PR close時
+└── docs/
+    └── architecture.md               # Phase 0: 設計書
+```
+
+## 前提条件
+
+- **Snowflake Enterprise Edition以上** (dbt projects on Snowflake のGA機能を利用)
+- **dbt projects on Snowflake は2025年11月にGA**: <https://docs.snowflake.com/en/user-guide/data-engineering/dbt-projects-on-snowflake>
+- GitBucket は self-hosted、CI Plugin有効
+- GitBucket から Snowflake への通信が可能 (Public endpoint or PrivateLink経由)
+
+## クイックスタート
+
+### Phase 1: 本番構築
+
+```bash
+# 1. Snowflake setup SQL を順番に実行 (ACCOUNTADMIN権限で)
+snowsql -c admin -f snowflake_setup/01_prod_database.sql
+snowsql -c admin -f snowflake_setup/02_prod_roles_and_users.sql
+snowsql -c admin -f snowflake_setup/03_git_integration.sql
+snowsql -c admin -f snowflake_setup/04_external_access.sql
+
+# 2. dbt projectを本番にデプロイ
+./scripts/deploy_prod.sh
+
+# 3. 動作確認
+snowsql -c admin -q "EXECUTE DBT PROJECT PROD_DBT_DB.deployments.dbt_proj_prod ARGS='build --target prod'"
+```
+
+### Phase 2: CI構築
+
+```bash
+# 1. CI用Snowflake環境
+snowsql -c admin -f snowflake_setup/05_ci_database.sql
+snowsql -c admin -f snowflake_setup/06_ci_roles.sql
+
+# 2. GitBucket Secrets登録
+#    SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, SNOWFLAKE_PRIVATE_KEY,
+#    SNOWFLAKE_ROLE=CI_ROLE, SNOWFLAKE_WAREHOUSE=CI_WH
+
+# 3. Docker imageをbuild & push (内部Registry前提)
+docker build -t internal-registry/dbt-ci:latest -f docker/Dockerfile docker/
+docker push internal-registry/dbt-ci:latest
+
+# 4. PR作成で .gitbucket/ci.yml が発火
+```
+
+詳細は `docs/architecture.md` を参照。
+
+-------------
+
 池田さんの案、方向性として正しいです。本番がSnowflake内のdbt projectで動くなら、CIはむしろ「本番と環境を分ける」必要があるので、その判断は理にかなっています。
 ただし、いくつか論点があります。整理しますね。
 池田さんの案の評価
