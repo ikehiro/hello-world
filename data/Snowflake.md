@@ -1,5 +1,360 @@
 # Snowflake
 
+
+
+いい質問です。本番フロー全体で Secrets Manager → Snowflake への秘密鍵の渡し方には、渡す相手によって複数のパターンがあります。
+まず、池田さんの本番構成を整理します:
+
+[Step Functions]
+  ↓
+[Lambda] ───→ ECS RunTask (Fargate起動)
+  ↓                     ↓
+  └ Snowflake?          [Fargate] ──→ Snowflake (dbt実行)
+                              ↑
+                        ここで鍵が必要
+
+
+鍵が必要になるのは Fargate 側 (dbt実行する場所) です。Lambdaは ecs:RunTask API を叩くだけなので鍵不要。
+ただし「dbt をSnowflake内 EXECUTE DBT PROJECT で動かす場合」と「Fargate内 dbt-core で動かす場合」で渡し方が変わるので、両方説明します。
+パターンA: Fargate dbt-core から渡す (一般的な構成)
+鍵の流れ
+
+[Secrets Manager]
+   "snowflake/dbt-prod/private-key"
+   { "private_key": "-----BEGIN..." }
+       ↓
+[ECS Task Definition の secrets プロパティ]
+       ↓
+[Fargate コンテナ起動時に環境変数注入]
+       ↓
+[コンテナ内で一時ファイル化]
+       ↓
+[dbt が private_key_path で参照]
+
+
+Step 1: Secrets Manager にKey を保管
+書き方が2つあります。
+方式1: JSON形式 (推奨)
+
+{
+  "account": "xy12345.ap-northeast-1.aws",
+  "user": "DBT_PROD_USER",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIE...\n-----END PRIVATE KEY-----",
+  "passphrase": ""
+}
+
+
+CLIで登録する場合:
+
+aws secretsmanager create-secret \
+  --name snowflake/dbt-prod \
+  --secret-string file://snowflake-secret.json \
+  --region ap-northeast-1
+
+
+方式2: 鍵のみ (PEM文字列をそのまま)
+
+aws secretsmanager create-secret \
+  --name snowflake/dbt-prod/private-key \
+  --secret-string "$(cat rsa_key.p8)" \
+  --region ap-northeast-1
+
+
+JSON形式の方が、user/account/passphraseも一緒に管理できて推奨です。
+Step 2: Fargate Task Definition で secrets 指定
+
+{
+  "family": "dbt-prod-task",
+  "taskRoleArn": "arn:aws:iam::123456789012:role/DbtFargateTaskRole",
+  "executionRoleArn": "arn:aws:iam::123456789012:role/DbtFargateExecRole",
+  "containerDefinitions": [
+    {
+      "name": "dbt-runner",
+      "image": "123.dkr.ecr.ap-northeast-1.amazonaws.com/dbt-runner:latest",
+      
+      "secrets": [
+        {
+          "name": "SNOWFLAKE_PRIVATE_KEY",
+          "valueFrom": "arn:aws:secretsmanager:ap-northeast-1:123:secret:snowflake/dbt-prod-AbCdEf:private_key::"
+        },
+        {
+          "name": "SNOWFLAKE_USER",
+          "valueFrom": "arn:aws:secretsmanager:ap-northeast-1:123:secret:snowflake/dbt-prod-AbCdEf:user::"
+        },
+        {
+          "name": "SNOWFLAKE_ACCOUNT",
+          "valueFrom": "arn:aws:secretsmanager:ap-northeast-1:123:secret:snowflake/dbt-prod-AbCdEf:account::"
+        }
+      ],
+      
+      "environment": [
+        {"name": "DBT_TARGET", "value": "prod"}
+      ]
+    }
+  ]
+}
+
+
+ポイント: ARN末尾の :private_key:: がJSONのフィールド指定。これで鍵だけ抽出できます。
+形式: <ARN>:<JSONキー>:<バージョンステージ>:<バージョンID>
+Step 3: IAM権限設定
+Execution Role (コンテナ起動時にSecretsを取得する役割):
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue"
+      ],
+      "Resource": [
+        "arn:aws:secretsmanager:ap-northeast-1:123:secret:snowflake/dbt-prod-*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "kms:Decrypt"
+      ],
+      "Resource": [
+        "arn:aws:kms:ap-northeast-1:123:key/<KMS-KEY-ID>"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "secretsmanager.ap-northeast-1.amazonaws.com"
+        }
+      }
+    }
+  ]
+}
+
+
+Task Role と Execution Role は別物:
+	∙	Execution Role: コンテナ起動時に ECSエージェント がSecretsを取得するため
+	∙	Task Role: コンテナ内のアプリが他AWSサービスを叩くため (S3, Snowflakeは外部なので関係なし)
+Step 4: コンテナ内で一時ファイル化
+
+#!/usr/bin/env bash
+# entrypoint.sh
+set -euo pipefail
+
+# Secrets Manager から ECS エージェントが SNOWFLAKE_PRIVATE_KEY 環境変数として注入済み
+
+# 一時ファイルに書き出し (dbt は private_key_path で参照する)
+KEY_FILE=$(mktemp /tmp/sf_key.XXXXXX.p8)
+chmod 600 "${KEY_FILE}"
+
+# printfで書き出し (echo より安全、改行混入を防ぐ)
+printf '%s' "${SNOWFLAKE_PRIVATE_KEY}" > "${KEY_FILE}"
+
+# 環境変数をクリア (もう必要ない)
+unset SNOWFLAKE_PRIVATE_KEY
+
+# trapで確実に削除 (異常終了時も)
+trap "shred -u ${KEY_FILE} 2>/dev/null || rm -f ${KEY_FILE}" EXIT
+
+# dbtに鍵パスを渡す
+export SNOWFLAKE_PRIVATE_KEY_PATH="${KEY_FILE}"
+
+# dbt実行
+cd /dbt
+dbt build --target prod
+
+
+Step 5: profiles.yml で参照
+
+snowflake:
+  target: prod
+  outputs:
+    prod:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PATH') }}"
+      role: DBT_PROD_ROLE
+      warehouse: PROD_WH
+      database: PROD_DB
+      schema: marts
+      threads: 8
+
+
+パターンB: Lambda から Snowflake に直接接続する場合
+Lambdaが EXECUTE DBT PROJECT をkickする構成では、Lambda自身がSnowflakeに接続するので、Lambda内で鍵を扱います。
+
+import boto3
+import json
+import snowflake.connector
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
+
+def lambda_handler(event, context):
+    # Secrets Manager から取得
+    secrets_client = boto3.client('secretsmanager')
+    response = secrets_client.get_secret_value(
+        SecretId='snowflake/dbt-prod'
+    )
+    secret = json.loads(response['SecretString'])
+    
+    # 秘密鍵を DER 形式に変換 (snowflake-connector-pythonの要求形式)
+    private_key_pem = secret['private_key'].encode()
+    p_key = serialization.load_pem_private_key(
+        private_key_pem,
+        password=None,  # passphraseなしの場合
+        backend=default_backend()
+    )
+    
+    pkb = p_key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+    
+    # Snowflakeに接続して非同期実行
+    conn = snowflake.connector.connect(
+        account=secret['account'],
+        user=secret['user'],
+        private_key=pkb,
+        role='DBT_PROD_ROLE',
+        warehouse='PROD_WH',
+        database='PROD_DBT_DB',
+        schema='DEPLOYMENTS'
+    )
+    
+    cur = conn.cursor()
+    cur.execute_async(
+        "EXECUTE DBT PROJECT PROD_DBT_DB.DEPLOYMENTS.DBT_PROJ_PROD ARGS='build --target prod'"
+    )
+    query_id = cur.sfqid
+    
+    # 秘密鍵をメモリから消去
+    pkb = None
+    p_key = None
+    
+    return {
+        'query_id': query_id,
+        'status': 'submitted'
+    }
+
+
+Lambda IAM権限:
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["secretsmanager:GetSecretValue"],
+      "Resource": "arn:aws:secretsmanager:ap-northeast-1:123:secret:snowflake/dbt-prod-*"
+    }
+  ]
+}
+
+
+パターンC: Snowflake Secret object に置く (最もモダン)
+実は、Snowflake内で完結させることもできます。AWS Secrets Manager を使わず、Snowflake内のSecret objectに鍵を置く方式。
+ただし、これは「SnowflakeからAWS等の外部サービスを叩く時の認証情報」を置くための機能であり、「SnowflakeにつなぐためのSnowflake鍵」を置く用途とは少し違います。今回のユースケースでは パターンA か B が適切です。
+推奨: パターンの選び方
+
+
+
+|構成                                              |推奨パターン                             |
+|------------------------------------------------|-----------------------------------|
+|Fargateでdbt-core実行                              |**パターンA** (ECS secrets)            |
+|Lambdaから `EXECUTE DBT PROJECT` 投下               |**パターンB** (Lambda内取得)              |
+|Step Functions → Fargate → Snowflake内dbt project|**パターンB** (LambdaがSnowflakeに接続して投下)|
+
+池田さんの現在の構成は Lambda → Fargate → Snowflake内dbt project を想定されているので、パターンBが本命になりそうです。
+セキュリティ強化のための追加考慮
+1. Secrets Manager 自体の暗号化
+デフォルトは AWS マネージドキー (aws/secretsmanager) ですが、本番では顧客管理KMSキーを推奨:
+
+aws secretsmanager create-secret \
+  --name snowflake/dbt-prod \
+  --secret-string file://secret.json \
+  --kms-key-id alias/dbt-secrets-key
+
+
+メリット:
+	∙	KMSキーへのアクセス権を別途制御可能
+	∙	CloudTrailで KMS Decrypt の監査ログが取れる
+	∙	キーローテーションをKMSで管理可能
+2. 自動ローテーション
+Secrets Managerには自動ローテーション機能がありますが、Snowflakeのkey pair認証は2つの公開鍵 (RSA_PUBLIC_KEY, RSA_PUBLIC_KEY_2) を持てるので、これを活かしたゼロダウンタイムローテーションが可能:
+
+-- 新しい鍵を追加 (既存も有効)
+ALTER USER DBT_PROD_USER SET RSA_PUBLIC_KEY_2='<new_pub_key>';
+
+-- AWS側でSecrets Manager更新 → 新鍵で接続テスト
+
+-- 古い鍵を削除
+ALTER USER DBT_PROD_USER UNSET RSA_PUBLIC_KEY;
+ALTER USER DBT_PROD_USER SET RSA_PUBLIC_KEY=<new_pub_key>;
+ALTER USER DBT_PROD_USER UNSET RSA_PUBLIC_KEY_2;
+
+
+Lambdaでローテーション処理を書けば、Secrets Managerの自動ローテーション機能と連携可能。
+3. VPC EndpointでSecrets Managerに繋ぐ
+Fargateが NAT Gateway 経由でなく、Secrets Manager VPC Endpoint 経由で取得するよう設定:
+
+[Fargate (Private Subnet)]
+    ↓
+[Secrets Manager Interface Endpoint]
+    ↓
+[Secrets Manager (AWSサービス)]
+
+
+これで通信がインターネットを経由せず、AWS内部で完結。前回構成図にもこのEndpointは入れていました。
+4. SecretのResource Policyで取得元を制限
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::123456789012:role/DbtFargateExecRole"
+      },
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:SourceVpce": "vpce-0123456789abcdef"
+        }
+      }
+    }
+  ]
+}
+
+
+このVPC Endpoint経由でしか取得できなくなり、鍵漏洩時の防御層が増えます。
+池田さん構成での具体実装
+Step Functions → Lambda → Snowflake内dbt project の構成だと、こうなります:
+
+[Secrets Manager]
+   snowflake/dbt-prod (KMS暗号化)
+   ├─ account
+   ├─ user
+   ├─ private_key (PEM全文)
+   └─ passphrase
+
+       ↓ (Secrets Manager VPC Endpoint経由)
+
+[Lambda] (VPC外配置)
+   ├─ boto3 で取得
+   ├─ snowflake-connector-python に渡す
+   ├─ EXECUTE DBT PROJECT を非同期投下
+   └─ メモリから秘密鍵を消去
+   
+       ↓
+[Snowflake内 dbt project が実行]
+
+
+Lambda関数の完全版コードまで書きましょうか? それともTerraformで Secrets Manager + IAM Role + KMS まで含めた一式作りますか?​​​​​​​​​​​​​​​​
+
+------------------
+
+
 # 設計書: dbt CI on Snowflake Native
 
 ## 1. 目的
