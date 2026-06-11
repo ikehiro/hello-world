@@ -1,6 +1,92 @@
 # Snowflake
 
 
+AWSアカウント内の全リソース一覧を取得する方法
+
+① AWS Config（最も網羅的・推奨）
+Config Resource Inventory を使う方法です。
+
+# リソースタイプ一覧を確認
+aws configservice get-discovered-resource-counts \
+  --region ap-northeast-1
+
+# 特定タイプのリソース一覧
+aws configservice list-discovered-resources \
+  --resource-type AWS::S3::Bucket \
+  --region ap-northeast-1
+
+
+	∙	✅ マルチリージョン対応
+	∙	✅ 削除済みリソースの履歴も残る
+	∙	⚠️ Config が有効になっている必要あり（有料）
+
+② AWS Resource Explorer（手軽・無料）
+コンソールから Resource Explorer を検索して有効化するだけ。
+
+# CLIでも検索可能
+aws resource-explorer-2 search \
+  --query-string "resourcetype:aws:s3:bucket" \
+  --region ap-northeast-1
+
+
+	∙	✅ 無料
+	∙	✅ 全リージョン横断で検索できる
+	∙	✅ タグ・リソースタイプで絞り込み可能
+	∙	⚠️ 一部サービスは未対応
+
+③ AWS Tag Editor（タグ付きリソース向け）
+コンソール → Resource Groups & Tag Editor → タグエディター
+	∙	✅ コンソールで直感的に操作できる
+	∙	✅ タグのないリソースも検索できる
+	∙	⚠️ エクスポートはCSV
+
+④ CloudFormation / Terraform（IaC管理済みの場合）
+
+# CloudFormationのスタック一覧
+aws cloudformation list-stacks \
+  --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE
+
+# スタック内リソース一覧
+aws cloudformation list-stack-resources \
+  --stack-name my-stack
+
+
+	∙	✅ 管理対象リソースは確実に把握できる
+	∙	⚠️ 手動作成リソースは拾えない
+
+⑤ Steampipe（OSS・一番詳細）
+SQL でAWSリソースをクエリできるOSSツール。
+
+-- 全EC2インスタンス
+SELECT instance_id, instance_type, region
+FROM aws_ec2_instance;
+
+-- 全S3バケット
+SELECT name, region, creation_date
+FROM aws_s3_bucket;
+
+
+	∙	✅ 非常に詳細・柔軟
+	∙	✅ 無料
+	∙	⚠️ インストールが必要
+
+目的別おすすめ
+
+
+
+|目的             |手段                   |
+|---------------|---------------------|
+|とりあえず今すぐ全体把握したい|**Resource Explorer**|
+|継続的な管理・変更履歴も必要 |**AWS Config**       |
+|タグ整理・棚卸し       |**Tag Editor**       |
+|詳細分析・レポート作成    |**Steampipe**        |
+|IaC管理済みのみ確認    |**CloudFormation**   |
+
+池田さんのPoC環境の棚卸し用途であれば、まず Resource Explorer を有効化 → 全リージョンスキャン、が一番手軽です。Config はすでに有効にされていますか？​​​​​​​​​​​​​​​​
+
+
+
+-------------
 
 いい質問です。本番フロー全体で Secrets Manager → Snowflake への秘密鍵の渡し方には、渡す相手によって複数のパターンがあります。
 まず、池田さんの本番構成を整理します:
