@@ -1,6 +1,140 @@
 # Snowflake
 
 
+# Step Functions × dbt on Snowflake：オーケストレーション方式比較
+
+## 前提：アーキテクチャ概要
+
+dbt プロジェクトは **Snowflake 上にデプロイ済み**（Git Integration 等）。  
+AWS Step Functions から以下いずれかの方式で Snowflake CLI（`snow dbt run`）を呼び出し、dbt を実行する。
+
+```
+Step Functions
+  ├─ A. ECS RunTask    → Fargate タスク起動 → snow dbt run → Snowflake上のdbt実行
+  ├─ B. Lambda コンテナ → Lambda(コンテナ)  → snow dbt run → Snowflake上のdbt実行
+  └─ C. Lambda Python  → Lambda(zip/Python) → snowflake-connector-python SDK → dbt実行
+```
+
+> **注意：C のみ Snowflake CLI を使わず SDK 呼び出しになる**
+
+-----
+
+## 1. 実行メカニズム比較
+
+|観点      |A. ECS RunTask     |B. Lambda コンテナ |C. Lambda Python|
+|--------|-------------------|---------------|----------------|
+|CLI の使用 |✅ snow dbt run     |✅ snow dbt run |❌ SDK 呼び出し      |
+|タイムアウト  |**なし（無制限）**        |⚠️ 15 分上限       |⚠️ 15 分上限        |
+|コールドスタート|30〜60 秒（Fargate 起動）|数秒〜十数秒         |数百 ms（最速）       |
+|同時実行制御  |タスク数上限で制御          |Lambda 同時実行数で制御|同左              |
+
+-----
+
+## 2. コスト比較
+
+|観点         |A. ECS RunTask|B. Lambda コンテナ|C. Lambda Python|
+|-----------|--------------|--------------|----------------|
+|課金単位       |vCPU / メモリ × 秒|GB-秒          |GB-秒            |
+|長時間実行      |✅ 有利（タイムアウトなし）|❌ 15 分で打ち切り   |❌ 同左            |
+|短時間・高頻度実行  |❌ 起動オーバーヘッドが割高|中程度           |✅ 最安            |
+|ECR イメージ保存料|あり            |あり            |**なし**          |
+
+**コスト感イメージ（dbt 実行が 5 分程度の場合）**
+
+```
+C（最安）< B < A（最高）
+※ Fargate は起動〜終了まで 1〜2 分のオーバーヘッドが乗る
+```
+
+-----
+
+## 3. セキュリティ比較
+
+|観点                        |A. ECS RunTask             |B. Lambda コンテナ                  |C. Lambda Python                |
+|--------------------------|---------------------------|--------------------------------|--------------------------------|
+|認証情報取得                    |Task Role → Secrets Manager|Execution Role → Secrets Manager|Execution Role → Secrets Manager|
+|Snowflake 接続              |key-pair 認証                |同左                              |同左                              |
+|ネットワーク                    |VPC + PrivateLink          |VPC + PrivateLink               |VPC + PrivateLink               |
+|**EIP 固定（Network Policy）**|✅ Fargate + EIP で対応可       |⚠️ Lambda は EIP 固定不可             |⚠️ 同左                            |
+|攻撃面                       |ECR + タスク定義                |ECR + Lambda                    |**Lambda のみ（最小）**               |
+|イメージ改ざんリスク                |ECR 管理が必要                  |同左                              |**なし**                          |
+
+### ⚠️ EIP 固定に関する重要事項
+
+Snowflake Network Policy に EIP を登録している構成では以下に注意が必要。
+
+```
+Lambda の送信元 IP は固定できない
+  → NAT Gateway 経由で固定 IP を確保する必要がある
+  → 追加コスト：NAT Gateway ≈ $0.045/時間 + データ転送料
+
+ECS Fargate は ENI に EIP をアタッチ可能
+  → Network Policy との整合性がクリーンに保てる
+```
+
+-----
+
+## 4. 運用・開発体験比較
+
+|観点                   |A. ECS RunTask     |B. Lambda コンテナ|C. Lambda Python|
+|---------------------|-------------------|--------------|----------------|
+|デプロイ複雑度              |高（タスク定義 + ECR）     |中（ECR のみ）     |**低（コードのみ）**    |
+|Snowflake CLI バージョン管理|コンテナに封入で明確         |同左            |不要              |
+|ローカル再現性              |✅ Docker で完全再現     |✅ 同左          |△ SDK 動作確認のみ    |
+|Step Functions 統合    |ネイティブ統合あり          |同左            |同左              |
+|実行ログ                 |CloudWatch + ECS ログ|CloudWatch    |CloudWatch      |
+
+-----
+
+## 5. 総合評価
+
+|評価軸             |A. ECS RunTask|B. Lambda コンテナ|C. Lambda Python|
+|----------------|:------------:|:------------:|:--------------:|
+|コスト             |△             |○             |◎               |
+|セキュリティ（EIP 固定構成）|◎             |△             |△               |
+|タイムアウト耐性        |◎             |△             |△               |
+|デプロイ容易性         |△             |○             |◎               |
+|CLI 整合性         |◎             |◎             |✕               |
+
+-----
+
+## 6. 推奨
+
+### EIP 固定 + Snowflake Network Policy 構成の場合
+
+**✅ 第一推奨：A（ECS RunTask）**
+
+|理由               |詳細                                           |
+|-----------------|---------------------------------------------|
+|Network Policy 整合|EIP を Fargate ENI に直接アタッチできるため、NAT Gateway 不要|
+|タイムアウトなし         |dbt 実行時間が読めない段階でも安全に運用できる                    |
+|CLI 整合性          |`snow dbt run` をそのまま使えるため、ローカルとの動作差異がない      |
+
+**🔁 将来の最適化候補：C（Lambda Python）**
+
+以下の条件が揃った場合に移行を検討：
+
+- NAT Gateway で送信元 IP を固定できる環境が整った
+- dbt 実行が短時間・高頻度のユースケースに変化した
+- Snowflake CLI への依存を SDK に切り替えたい
+
+**❌ 非推奨：B（Lambda コンテナ）**
+
+- ECS RunTask の「タイムアウトなし」の利点がない
+- Lambda Python の「軽量・低コスト」の利点もない
+- EIP 固定も別途 NAT Gateway が必要
+- 採用する積極的な理由がない
+
+-----
+
+## まとめ
+
+> EIP 固定が設計済みである場合、**A（ECS RunTask）が最適解**。  
+> B・C はいずれも NAT Gateway を挟まないと Snowflake Network Policy と整合しないため、  
+> その追加コストを払うなら最初から Fargate で完結させる方が構成がシンプルになる。
+
+
+------------
 AWSアカウント内の全リソース一覧を取得する方法
 
 ① AWS Config（最も網羅的・推奨）
