@@ -1,5 +1,580 @@
 # Snowflake
 
+
+# Step Functions × dbt on Snowflake：オーケストレーション方式比較
+
+## 前提：アーキテクチャ概要
+
+dbt プロジェクトは **Snowflake 上にデプロイ済み**（Git Integration 等）。  
+AWS Step Functions から以下いずれかの方式で Snowflake CLI（`snow dbt run`）を呼び出し、dbt を実行する。
+
+```
+Step Functions
+  ├─ A. ECS RunTask    → Fargate タスク起動 → snow dbt run → Snowflake上のdbt実行
+  ├─ B. Lambda コンテナ → Lambda(コンテナ)  → snow dbt run → Snowflake上のdbt実行
+  └─ C. Lambda Python  → Lambda(zip/Python) → snowflake-connector-python SDK → dbt実行
+```
+
+> **注意：C のみ Snowflake CLI を使わず SDK 呼び出しになる**
+
+-----
+
+## 1. 実行メカニズム比較
+
+|観点      |A. ECS RunTask     |B. Lambda コンテナ |C. Lambda Python|
+|--------|-------------------|---------------|----------------|
+|CLI の使用 |✅ snow dbt run     |✅ snow dbt run |❌ SDK 呼び出し      |
+|タイムアウト  |**なし（無制限）**        |⚠️ 15 分上限       |⚠️ 15 分上限        |
+|コールドスタート|30〜60 秒（Fargate 起動）|数秒〜十数秒         |数百 ms（最速）       |
+|同時実行制御  |タスク数上限で制御          |Lambda 同時実行数で制御|同左              |
+
+-----
+
+## 2. コスト比較
+
+|観点         |A. ECS RunTask|B. Lambda コンテナ|C. Lambda Python|
+|-----------|--------------|--------------|----------------|
+|課金単位       |vCPU / メモリ × 秒|GB-秒          |GB-秒            |
+|長時間実行      |✅ 有利（タイムアウトなし）|❌ 15 分で打ち切り   |❌ 同左            |
+|短時間・高頻度実行  |❌ 起動オーバーヘッドが割高|中程度           |✅ 最安            |
+|ECR イメージ保存料|あり            |あり            |**なし**          |
+
+**コスト感イメージ（dbt 実行が 5 分程度の場合）**
+
+```
+C（最安）< B < A（最高）
+※ Fargate は起動〜終了まで 1〜2 分のオーバーヘッドが乗る
+```
+
+-----
+
+## 3. セキュリティ比較
+
+|観点                        |A. ECS RunTask             |B. Lambda コンテナ                  |C. Lambda Python                |
+|--------------------------|---------------------------|--------------------------------|--------------------------------|
+|認証情報取得                    |Task Role → Secrets Manager|Execution Role → Secrets Manager|Execution Role → Secrets Manager|
+|Snowflake 接続              |key-pair 認証                |同左                              |同左                              |
+|ネットワーク                    |VPC + PrivateLink          |VPC + PrivateLink               |VPC + PrivateLink               |
+|**EIP 固定（Network Policy）**|✅ Fargate + EIP で対応可       |⚠️ Lambda は EIP 固定不可             |⚠️ 同左                            |
+|攻撃面                       |ECR + タスク定義                |ECR + Lambda                    |**Lambda のみ（最小）**               |
+|イメージ改ざんリスク                |ECR 管理が必要                  |同左                              |**なし**                          |
+
+### ⚠️ EIP 固定に関する重要事項
+
+Snowflake Network Policy に EIP を登録している構成では以下に注意が必要。
+
+```
+Lambda の送信元 IP は固定できない
+  → NAT Gateway 経由で固定 IP を確保する必要がある
+  → 追加コスト：NAT Gateway ≈ $0.045/時間 + データ転送料
+
+ECS Fargate は ENI に EIP をアタッチ可能
+  → Network Policy との整合性がクリーンに保てる
+```
+
+-----
+
+## 4. 運用・開発体験比較
+
+|観点                   |A. ECS RunTask     |B. Lambda コンテナ|C. Lambda Python|
+|---------------------|-------------------|--------------|----------------|
+|デプロイ複雑度              |高（タスク定義 + ECR）     |中（ECR のみ）     |**低（コードのみ）**    |
+|Snowflake CLI バージョン管理|コンテナに封入で明確         |同左            |不要              |
+|ローカル再現性              |✅ Docker で完全再現     |✅ 同左          |△ SDK 動作確認のみ    |
+|Step Functions 統合    |ネイティブ統合あり          |同左            |同左              |
+|実行ログ                 |CloudWatch + ECS ログ|CloudWatch    |CloudWatch      |
+
+-----
+
+## 5. 総合評価
+
+|評価軸             |A. ECS RunTask|B. Lambda コンテナ|C. Lambda Python|
+|----------------|:------------:|:------------:|:--------------:|
+|コスト             |△             |○             |◎               |
+|セキュリティ（EIP 固定構成）|◎             |△             |△               |
+|タイムアウト耐性        |◎             |△             |△               |
+|デプロイ容易性         |△             |○             |◎               |
+|CLI 整合性         |◎             |◎             |✕               |
+
+-----
+
+## 6. 推奨
+
+### EIP 固定 + Snowflake Network Policy 構成の場合
+
+**✅ 第一推奨：A（ECS RunTask）**
+
+|理由               |詳細                                           |
+|-----------------|---------------------------------------------|
+|Network Policy 整合|EIP を Fargate ENI に直接アタッチできるため、NAT Gateway 不要|
+|タイムアウトなし         |dbt 実行時間が読めない段階でも安全に運用できる                    |
+|CLI 整合性          |`snow dbt run` をそのまま使えるため、ローカルとの動作差異がない      |
+
+**🔁 将来の最適化候補：C（Lambda Python）**
+
+以下の条件が揃った場合に移行を検討：
+
+- NAT Gateway で送信元 IP を固定できる環境が整った
+- dbt 実行が短時間・高頻度のユースケースに変化した
+- Snowflake CLI への依存を SDK に切り替えたい
+
+**❌ 非推奨：B（Lambda コンテナ）**
+
+- ECS RunTask の「タイムアウトなし」の利点がない
+- Lambda Python の「軽量・低コスト」の利点もない
+- EIP 固定も別途 NAT Gateway が必要
+- 採用する積極的な理由がない
+
+-----
+
+## まとめ
+
+> EIP 固定が設計済みである場合、**A（ECS RunTask）が最適解**。  
+> B・C はいずれも NAT Gateway を挟まないと Snowflake Network Policy と整合しないため、  
+> その追加コストを払うなら最初から Fargate で完結させる方が構成がシンプルになる。
+
+
+------------
+AWSアカウント内の全リソース一覧を取得する方法
+
+① AWS Config（最も網羅的・推奨）
+Config Resource Inventory を使う方法です。
+
+# リソースタイプ一覧を確認
+aws configservice get-discovered-resource-counts \
+  --region ap-northeast-1
+
+# 特定タイプのリソース一覧
+aws configservice list-discovered-resources \
+  --resource-type AWS::S3::Bucket \
+  --region ap-northeast-1
+
+
+	∙	✅ マルチリージョン対応
+	∙	✅ 削除済みリソースの履歴も残る
+	∙	⚠️ Config が有効になっている必要あり（有料）
+
+② AWS Resource Explorer（手軽・無料）
+コンソールから Resource Explorer を検索して有効化するだけ。
+
+# CLIでも検索可能
+aws resource-explorer-2 search \
+  --query-string "resourcetype:aws:s3:bucket" \
+  --region ap-northeast-1
+
+
+	∙	✅ 無料
+	∙	✅ 全リージョン横断で検索できる
+	∙	✅ タグ・リソースタイプで絞り込み可能
+	∙	⚠️ 一部サービスは未対応
+
+③ AWS Tag Editor（タグ付きリソース向け）
+コンソール → Resource Groups & Tag Editor → タグエディター
+	∙	✅ コンソールで直感的に操作できる
+	∙	✅ タグのないリソースも検索できる
+	∙	⚠️ エクスポートはCSV
+
+④ CloudFormation / Terraform（IaC管理済みの場合）
+
+# CloudFormationのスタック一覧
+aws cloudformation list-stacks \
+  --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE
+
+# スタック内リソース一覧
+aws cloudformation list-stack-resources \
+  --stack-name my-stack
+
+
+	∙	✅ 管理対象リソースは確実に把握できる
+	∙	⚠️ 手動作成リソースは拾えない
+
+⑤ Steampipe（OSS・一番詳細）
+SQL でAWSリソースをクエリできるOSSツール。
+
+-- 全EC2インスタンス
+SELECT instance_id, instance_type, region
+FROM aws_ec2_instance;
+
+-- 全S3バケット
+SELECT name, region, creation_date
+FROM aws_s3_bucket;
+
+
+	∙	✅ 非常に詳細・柔軟
+	∙	✅ 無料
+	∙	⚠️ インストールが必要
+
+目的別おすすめ
+
+
+
+|目的             |手段                   |
+|---------------|---------------------|
+|とりあえず今すぐ全体把握したい|**Resource Explorer**|
+|継続的な管理・変更履歴も必要 |**AWS Config**       |
+|タグ整理・棚卸し       |**Tag Editor**       |
+|詳細分析・レポート作成    |**Steampipe**        |
+|IaC管理済みのみ確認    |**CloudFormation**   |
+
+池田さんのPoC環境の棚卸し用途であれば、まず Resource Explorer を有効化 → 全リージョンスキャン、が一番手軽です。Config はすでに有効にされていますか？​​​​​​​​​​​​​​​​
+
+
+
+-------------
+
+いい質問です。本番フロー全体で Secrets Manager → Snowflake への秘密鍵の渡し方には、渡す相手によって複数のパターンがあります。
+まず、池田さんの本番構成を整理します:
+
+[Step Functions]
+  ↓
+[Lambda] ───→ ECS RunTask (Fargate起動)
+  ↓                     ↓
+  └ Snowflake?          [Fargate] ──→ Snowflake (dbt実行)
+                              ↑
+                        ここで鍵が必要
+
+
+鍵が必要になるのは Fargate 側 (dbt実行する場所) です。Lambdaは ecs:RunTask API を叩くだけなので鍵不要。
+ただし「dbt をSnowflake内 EXECUTE DBT PROJECT で動かす場合」と「Fargate内 dbt-core で動かす場合」で渡し方が変わるので、両方説明します。
+パターンA: Fargate dbt-core から渡す (一般的な構成)
+鍵の流れ
+
+[Secrets Manager]
+   "snowflake/dbt-prod/private-key"
+   { "private_key": "-----BEGIN..." }
+       ↓
+[ECS Task Definition の secrets プロパティ]
+       ↓
+[Fargate コンテナ起動時に環境変数注入]
+       ↓
+[コンテナ内で一時ファイル化]
+       ↓
+[dbt が private_key_path で参照]
+
+
+Step 1: Secrets Manager にKey を保管
+書き方が2つあります。
+方式1: JSON形式 (推奨)
+
+{
+  "account": "xy12345.ap-northeast-1.aws",
+  "user": "DBT_PROD_USER",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIE...\n-----END PRIVATE KEY-----",
+  "passphrase": ""
+}
+
+
+CLIで登録する場合:
+
+aws secretsmanager create-secret \
+  --name snowflake/dbt-prod \
+  --secret-string file://snowflake-secret.json \
+  --region ap-northeast-1
+
+
+方式2: 鍵のみ (PEM文字列をそのまま)
+
+aws secretsmanager create-secret \
+  --name snowflake/dbt-prod/private-key \
+  --secret-string "$(cat rsa_key.p8)" \
+  --region ap-northeast-1
+
+
+JSON形式の方が、user/account/passphraseも一緒に管理できて推奨です。
+Step 2: Fargate Task Definition で secrets 指定
+
+{
+  "family": "dbt-prod-task",
+  "taskRoleArn": "arn:aws:iam::123456789012:role/DbtFargateTaskRole",
+  "executionRoleArn": "arn:aws:iam::123456789012:role/DbtFargateExecRole",
+  "containerDefinitions": [
+    {
+      "name": "dbt-runner",
+      "image": "123.dkr.ecr.ap-northeast-1.amazonaws.com/dbt-runner:latest",
+      
+      "secrets": [
+        {
+          "name": "SNOWFLAKE_PRIVATE_KEY",
+          "valueFrom": "arn:aws:secretsmanager:ap-northeast-1:123:secret:snowflake/dbt-prod-AbCdEf:private_key::"
+        },
+        {
+          "name": "SNOWFLAKE_USER",
+          "valueFrom": "arn:aws:secretsmanager:ap-northeast-1:123:secret:snowflake/dbt-prod-AbCdEf:user::"
+        },
+        {
+          "name": "SNOWFLAKE_ACCOUNT",
+          "valueFrom": "arn:aws:secretsmanager:ap-northeast-1:123:secret:snowflake/dbt-prod-AbCdEf:account::"
+        }
+      ],
+      
+      "environment": [
+        {"name": "DBT_TARGET", "value": "prod"}
+      ]
+    }
+  ]
+}
+
+
+ポイント: ARN末尾の :private_key:: がJSONのフィールド指定。これで鍵だけ抽出できます。
+形式: <ARN>:<JSONキー>:<バージョンステージ>:<バージョンID>
+Step 3: IAM権限設定
+Execution Role (コンテナ起動時にSecretsを取得する役割):
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue"
+      ],
+      "Resource": [
+        "arn:aws:secretsmanager:ap-northeast-1:123:secret:snowflake/dbt-prod-*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "kms:Decrypt"
+      ],
+      "Resource": [
+        "arn:aws:kms:ap-northeast-1:123:key/<KMS-KEY-ID>"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "secretsmanager.ap-northeast-1.amazonaws.com"
+        }
+      }
+    }
+  ]
+}
+
+
+Task Role と Execution Role は別物:
+	∙	Execution Role: コンテナ起動時に ECSエージェント がSecretsを取得するため
+	∙	Task Role: コンテナ内のアプリが他AWSサービスを叩くため (S3, Snowflakeは外部なので関係なし)
+Step 4: コンテナ内で一時ファイル化
+
+#!/usr/bin/env bash
+# entrypoint.sh
+set -euo pipefail
+
+# Secrets Manager から ECS エージェントが SNOWFLAKE_PRIVATE_KEY 環境変数として注入済み
+
+# 一時ファイルに書き出し (dbt は private_key_path で参照する)
+KEY_FILE=$(mktemp /tmp/sf_key.XXXXXX.p8)
+chmod 600 "${KEY_FILE}"
+
+# printfで書き出し (echo より安全、改行混入を防ぐ)
+printf '%s' "${SNOWFLAKE_PRIVATE_KEY}" > "${KEY_FILE}"
+
+# 環境変数をクリア (もう必要ない)
+unset SNOWFLAKE_PRIVATE_KEY
+
+# trapで確実に削除 (異常終了時も)
+trap "shred -u ${KEY_FILE} 2>/dev/null || rm -f ${KEY_FILE}" EXIT
+
+# dbtに鍵パスを渡す
+export SNOWFLAKE_PRIVATE_KEY_PATH="${KEY_FILE}"
+
+# dbt実行
+cd /dbt
+dbt build --target prod
+
+
+Step 5: profiles.yml で参照
+
+snowflake:
+  target: prod
+  outputs:
+    prod:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PATH') }}"
+      role: DBT_PROD_ROLE
+      warehouse: PROD_WH
+      database: PROD_DB
+      schema: marts
+      threads: 8
+
+
+パターンB: Lambda から Snowflake に直接接続する場合
+Lambdaが EXECUTE DBT PROJECT をkickする構成では、Lambda自身がSnowflakeに接続するので、Lambda内で鍵を扱います。
+
+import boto3
+import json
+import snowflake.connector
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
+
+def lambda_handler(event, context):
+    # Secrets Manager から取得
+    secrets_client = boto3.client('secretsmanager')
+    response = secrets_client.get_secret_value(
+        SecretId='snowflake/dbt-prod'
+    )
+    secret = json.loads(response['SecretString'])
+    
+    # 秘密鍵を DER 形式に変換 (snowflake-connector-pythonの要求形式)
+    private_key_pem = secret['private_key'].encode()
+    p_key = serialization.load_pem_private_key(
+        private_key_pem,
+        password=None,  # passphraseなしの場合
+        backend=default_backend()
+    )
+    
+    pkb = p_key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+    
+    # Snowflakeに接続して非同期実行
+    conn = snowflake.connector.connect(
+        account=secret['account'],
+        user=secret['user'],
+        private_key=pkb,
+        role='DBT_PROD_ROLE',
+        warehouse='PROD_WH',
+        database='PROD_DBT_DB',
+        schema='DEPLOYMENTS'
+    )
+    
+    cur = conn.cursor()
+    cur.execute_async(
+        "EXECUTE DBT PROJECT PROD_DBT_DB.DEPLOYMENTS.DBT_PROJ_PROD ARGS='build --target prod'"
+    )
+    query_id = cur.sfqid
+    
+    # 秘密鍵をメモリから消去
+    pkb = None
+    p_key = None
+    
+    return {
+        'query_id': query_id,
+        'status': 'submitted'
+    }
+
+
+Lambda IAM権限:
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["secretsmanager:GetSecretValue"],
+      "Resource": "arn:aws:secretsmanager:ap-northeast-1:123:secret:snowflake/dbt-prod-*"
+    }
+  ]
+}
+
+
+パターンC: Snowflake Secret object に置く (最もモダン)
+実は、Snowflake内で完結させることもできます。AWS Secrets Manager を使わず、Snowflake内のSecret objectに鍵を置く方式。
+ただし、これは「SnowflakeからAWS等の外部サービスを叩く時の認証情報」を置くための機能であり、「SnowflakeにつなぐためのSnowflake鍵」を置く用途とは少し違います。今回のユースケースでは パターンA か B が適切です。
+推奨: パターンの選び方
+
+
+
+|構成                                              |推奨パターン                             |
+|------------------------------------------------|-----------------------------------|
+|Fargateでdbt-core実行                              |**パターンA** (ECS secrets)            |
+|Lambdaから `EXECUTE DBT PROJECT` 投下               |**パターンB** (Lambda内取得)              |
+|Step Functions → Fargate → Snowflake内dbt project|**パターンB** (LambdaがSnowflakeに接続して投下)|
+
+池田さんの現在の構成は Lambda → Fargate → Snowflake内dbt project を想定されているので、パターンBが本命になりそうです。
+セキュリティ強化のための追加考慮
+1. Secrets Manager 自体の暗号化
+デフォルトは AWS マネージドキー (aws/secretsmanager) ですが、本番では顧客管理KMSキーを推奨:
+
+aws secretsmanager create-secret \
+  --name snowflake/dbt-prod \
+  --secret-string file://secret.json \
+  --kms-key-id alias/dbt-secrets-key
+
+
+メリット:
+	∙	KMSキーへのアクセス権を別途制御可能
+	∙	CloudTrailで KMS Decrypt の監査ログが取れる
+	∙	キーローテーションをKMSで管理可能
+2. 自動ローテーション
+Secrets Managerには自動ローテーション機能がありますが、Snowflakeのkey pair認証は2つの公開鍵 (RSA_PUBLIC_KEY, RSA_PUBLIC_KEY_2) を持てるので、これを活かしたゼロダウンタイムローテーションが可能:
+
+-- 新しい鍵を追加 (既存も有効)
+ALTER USER DBT_PROD_USER SET RSA_PUBLIC_KEY_2='<new_pub_key>';
+
+-- AWS側でSecrets Manager更新 → 新鍵で接続テスト
+
+-- 古い鍵を削除
+ALTER USER DBT_PROD_USER UNSET RSA_PUBLIC_KEY;
+ALTER USER DBT_PROD_USER SET RSA_PUBLIC_KEY=<new_pub_key>;
+ALTER USER DBT_PROD_USER UNSET RSA_PUBLIC_KEY_2;
+
+
+Lambdaでローテーション処理を書けば、Secrets Managerの自動ローテーション機能と連携可能。
+3. VPC EndpointでSecrets Managerに繋ぐ
+Fargateが NAT Gateway 経由でなく、Secrets Manager VPC Endpoint 経由で取得するよう設定:
+
+[Fargate (Private Subnet)]
+    ↓
+[Secrets Manager Interface Endpoint]
+    ↓
+[Secrets Manager (AWSサービス)]
+
+
+これで通信がインターネットを経由せず、AWS内部で完結。前回構成図にもこのEndpointは入れていました。
+4. SecretのResource Policyで取得元を制限
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::123456789012:role/DbtFargateExecRole"
+      },
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:SourceVpce": "vpce-0123456789abcdef"
+        }
+      }
+    }
+  ]
+}
+
+
+このVPC Endpoint経由でしか取得できなくなり、鍵漏洩時の防御層が増えます。
+池田さん構成での具体実装
+Step Functions → Lambda → Snowflake内dbt project の構成だと、こうなります:
+
+[Secrets Manager]
+   snowflake/dbt-prod (KMS暗号化)
+   ├─ account
+   ├─ user
+   ├─ private_key (PEM全文)
+   └─ passphrase
+
+       ↓ (Secrets Manager VPC Endpoint経由)
+
+[Lambda] (VPC外配置)
+   ├─ boto3 で取得
+   ├─ snowflake-connector-python に渡す
+   ├─ EXECUTE DBT PROJECT を非同期投下
+   └─ メモリから秘密鍵を消去
+   
+       ↓
+[Snowflake内 dbt project が実行]
+
+
+Lambda関数の完全版コードまで書きましょうか? それともTerraformで Secrets Manager + IAM Role + KMS まで含めた一式作りますか?​​​​​​​​​​​​​​​​
+
+------------------
+
+
 # 設計書: dbt CI on Snowflake Native
 
 ## 1. 目的
