@@ -101,3 +101,141 @@ Cortex Agent の編集操作は、そのロールがユーザーのデフォル�
 AI_DEVELOPER ロールを使って Agents を管理する場合は、ユーザーのデフォルトロールに設定しておく必要があります：
 
 ALTER USER <target_user> SET DEFAULT_ROLE = AI_DEVELOPER;
+
+
+
+
+
+
+---------------
+
+なるほど、理解しました。整理し直します。
+
+修正後の概念整理
+
+DR（Database Role）
+  = Snowflake が提供するオブジェクト単位の権限
+  = SELECT / USAGE / CREATE など、リソースへの直接アクセス権
+  = 自作も可能（例：dr_DEV_DB_READ）
+
+AR（Action Role）
+  = DR を束ねて「何ができるか」を表す
+  = ARだけで完結することもある（DRを使わず直接Privilege付与）
+
+FR（Functional Role）
+  = ARを束ねてユーザーに付与する最終ロール
+
+
+修正後のロール階層
+
+fr_AI_POC_DEVELOPER
+    │
+    ├─ ar_AI_USE
+    │       ├─ DR: SNOWFLAKE.CORTEX_USER   （Snowflake提供DB Role）
+    │       ├─ DR: SNOWFLAKE.COPILOT_USER  （Snowflake提供DB Role）
+    │       └─ Privilege: USE AI FUNCTIONS  （Account Privilege）
+    │
+    ├─ ar_AI_BUILD
+    │       ├─ dr_AI_SCHEMA_BUILD（自作DR）
+    │       │       ├─ CREATE MODEL ON SCHEMA
+    │       │       ├─ CREATE CORTEX SEARCH SERVICE ON SCHEMA
+    │       │       ├─ CREATE TABLE ON SCHEMA
+    │       │       └─ CREATE PROCEDURE ON SCHEMA
+    │       └─ USAGE ON WAREHOUSE（直接付与）
+    │
+    └─ ar_DEV_DB_READ
+            └─ dr_DEV_DB_READ（自作DR）
+                    ├─ USAGE ON DATABASE
+                    ├─ USAGE ON ALL SCHEMAS
+                    ├─ SELECT ON ALL TABLES  (+ FUTURE)
+                    └─ SELECT ON ALL VIEWS   (+ FUTURE)
+
+
+本番用 SQL
+
+USE ROLE ACCOUNTADMIN;
+
+-- ============================================================
+-- Database Role 1: 開発DBの参照権限（自作DR）
+-- ============================================================
+CREATE DATABASE ROLE IF NOT EXISTS <DEV_DB>.dr_DEV_DB_READ;
+
+GRANT USAGE  ON DATABASE  <DEV_DB>                         TO DATABASE ROLE <DEV_DB>.dr_DEV_DB_READ;
+GRANT USAGE  ON ALL SCHEMAS IN DATABASE <DEV_DB>           TO DATABASE ROLE <DEV_DB>.dr_DEV_DB_READ;
+GRANT USAGE  ON FUTURE SCHEMAS IN DATABASE <DEV_DB>        TO DATABASE ROLE <DEV_DB>.dr_DEV_DB_READ;
+GRANT SELECT ON ALL TABLES  IN DATABASE <DEV_DB>           TO DATABASE ROLE <DEV_DB>.dr_DEV_DB_READ;
+GRANT SELECT ON ALL VIEWS   IN DATABASE <DEV_DB>           TO DATABASE ROLE <DEV_DB>.dr_DEV_DB_READ;
+GRANT SELECT ON FUTURE TABLES IN DATABASE <DEV_DB>         TO DATABASE ROLE <DEV_DB>.dr_DEV_DB_READ;
+GRANT SELECT ON FUTURE VIEWS  IN DATABASE <DEV_DB>         TO DATABASE ROLE <DEV_DB>.dr_DEV_DB_READ;
+
+-- ============================================================
+-- Database Role 2: AIスキーマへのオブジェクト作成権限（自作DR）
+-- ============================================================
+CREATE DATABASE ROLE IF NOT EXISTS <DEV_DB>.dr_AI_SCHEMA_BUILD;
+
+GRANT CREATE MODEL                 ON SCHEMA <DEV_DB>.<AI_SCHEMA> TO DATABASE ROLE <DEV_DB>.dr_AI_SCHEMA_BUILD;
+GRANT CREATE CORTEX SEARCH SERVICE ON SCHEMA <DEV_DB>.<AI_SCHEMA> TO DATABASE ROLE <DEV_DB>.dr_AI_SCHEMA_BUILD;
+GRANT CREATE TABLE                 ON SCHEMA <DEV_DB>.<AI_SCHEMA> TO DATABASE ROLE <DEV_DB>.dr_AI_SCHEMA_BUILD;
+GRANT CREATE PROCEDURE             ON SCHEMA <DEV_DB>.<AI_SCHEMA> TO DATABASE ROLE <DEV_DB>.dr_AI_SCHEMA_BUILD;
+
+-- ============================================================
+-- Action Role 1: AI機能の実行（DRを束ねる）
+-- ============================================================
+CREATE ROLE IF NOT EXISTS ar_AI_USE;
+
+GRANT DATABASE ROLE SNOWFLAKE.CORTEX_USER  TO ROLE ar_AI_USE;
+GRANT DATABASE ROLE SNOWFLAKE.COPILOT_USER TO ROLE ar_AI_USE;
+GRANT PRIVILEGE USE AI FUNCTIONS           TO ROLE ar_AI_USE;
+
+-- ============================================================
+-- Action Role 2: AIオブジェクトの構築（DR + WH権限）
+-- ============================================================
+CREATE ROLE IF NOT EXISTS ar_AI_BUILD;
+
+GRANT DATABASE ROLE <DEV_DB>.dr_AI_SCHEMA_BUILD TO ROLE ar_AI_BUILD;
+GRANT USAGE ON WAREHOUSE <DEV_WH>               TO ROLE ar_AI_BUILD;
+
+-- ============================================================
+-- Action Role 3: 開発DBデータ参照（DRを束ねる）
+-- ============================================================
+CREATE ROLE IF NOT EXISTS ar_DEV_DB_READ;
+
+GRANT DATABASE ROLE <DEV_DB>.dr_DEV_DB_READ TO ROLE ar_DEV_DB_READ;
+
+-- ============================================================
+-- Functional Role: ユーザーに付与するロール
+-- ============================================================
+CREATE ROLE IF NOT EXISTS fr_AI_POC_DEVELOPER;
+
+GRANT ROLE ar_AI_USE     TO ROLE fr_AI_POC_DEVELOPER;
+GRANT ROLE ar_AI_BUILD   TO ROLE fr_AI_POC_DEVELOPER;
+GRANT ROLE ar_DEV_DB_READ TO ROLE fr_AI_POC_DEVELOPER;
+
+-- ============================================================
+-- ユーザー作成・ロール付与
+-- ============================================================
+CREATE USER IF NOT EXISTS DEV_AI_POC
+    TYPE                 = PERSON
+    DEFAULT_ROLE         = fr_AI_POC_DEVELOPER
+    DEFAULT_WAREHOUSE    = <DEV_WH>
+    DEFAULT_NAMESPACE    = <DEV_DB>.<AI_SCHEMA>
+    MUST_CHANGE_PASSWORD = TRUE;
+
+GRANT ROLE fr_AI_POC_DEVELOPER TO USER DEV_AI_POC;
+
+
+考え方のまとめ
+
+
+
+|層 |命名      |何を入れるか                                      |
+|--|--------|--------------------------------------------|
+|DR|`dr_XXX`|SELECT・USAGE・CREATEなどリソース権限。Snowflake提供DRもここ|
+|AR|`ar_XXX`|DRを束ねて「行為」を表す。WHなど直接Privilegeもここ            |
+|FR|`fr_XXX`|ARを束ねてユーザーに付与                               |
+
+ar_AI_USE のように Snowflake 提供の DR（CORTEX_USER 等）を AR で束ねるパターンと、自作 DR（dr_DEV_DB_READ）を AR で束ねるパターンの両方が共存する形になります。​​​​​​​​​​​​​​​​
+
+
+
+
