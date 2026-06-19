@@ -449,3 +449,84 @@ SHOW GRANTS TO USER DEV_AI*{{ name }};
 – ============================================================
 
 
+少し調べてみます。​​​​​​​​​​​​​​​​
+
+わかりました。EAI の正体が見えました。
+
+EAI = External Access Integration です
+EAI は External Access Integration の略で、Snowflake から外部 API（インターネット上のエンドポイント）に接続するための統合設定です。 ￼
+
+Cortex AI のネイティブ機能とは別物
+重要な整理として：
+
+Cortex AI のネイティブ機能（AI_COMPLETE 等）
+  → EAI は不要
+  → Snowflake 内で完結するため設定なしで使える
+
+外部 API を呼ぶ場合
+  → EAI が必要
+  → 例: OpenAI API を直接呼ぶ
+         Google Vertex AI を呼ぶ
+         Finnhub 等の外部データ API を呼ぶ
+         自社の REST API を Stored Procedure から叩く
+
+
+EAI が必要になる具体的なシーン
+Stored Procedure や UDF から外部 API を呼ぶ場合、EXTERNAL_ACCESS_INTEGRATIONS = (NASA_EAI) のように EAI を指定する必要があります。Cortex Agents のカスタムツールとして外部 API を組み込む際にも同様です。 ￼
+
+-- EAI を使う Stored Procedure の例
+CREATE OR REPLACE PROCEDURE call_external_api()
+RETURNS STRING
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.10'
+PACKAGES = ('requests')
+EXTERNAL_ACCESS_INTEGRATIONS = (MY_EAI)   -- ← ここで EAI を指定
+SECRETS = ('api_key' = MY_API_KEY)
+HANDLER = 'main'
+AS $$
+import requests
+def main(session):
+    response = requests.get("https://api.example.com/data")
+    return response.text
+$$;
+
+
+EAI の作成手順（必要な場合）
+
+USE ROLE ACCOUNTADMIN;
+
+-- 1. ネットワークルール（接続先を定義）
+CREATE OR REPLACE NETWORK RULE my_api_network_rule
+    TYPE  = HOST_PORT
+    MODE  = EGRESS
+    VALUE_LIST = ('api.example.com:443');
+
+-- 2. シークレット（APIキーを安全に保管）
+CREATE OR REPLACE SECRET my_api_key
+    TYPE                = GENERIC_STRING
+    SECRET_STRING       = 'your-api-key-here';
+
+-- 3. EAI の作成
+CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION my_eai
+    ALLOWED_NETWORK_RULES = (my_api_network_rule)
+    ALLOWED_AUTHENTICATION_SECRETS = (my_api_key)
+    ENABLED = TRUE;
+
+-- 4. 開発者ロールへの使用権限付与
+GRANT USAGE ON INTEGRATION my_eai TO ROLE fr_IKEDA_AI_POC_DEVELOPER;
+
+
+まとめ
+
+
+
+|用途                                          |EAI 必要？|
+|--------------------------------------------|-------|
+|AI_COMPLETE / AI_SUMMARIZE 等のネイティブ Cortex 関数|❌ 不要   |
+|Cortex Agents（Cortex Search / Analyst を使う）  |❌ 不要   |
+|Cortex Code（Snowsight チャット）                 |❌ 不要   |
+|Stored Procedure / UDF から外部 API を呼ぶ         |✅ 必要   |
+|Cortex Agents のカスタムツールで外部 API を組み込む         |✅ 必要   |
+
+今回の PoC で外部 API 連携を試す予定がある場合は、先ほどの fr_IKEDA_AI_POC_DEVELOPER に GRANT USAGE ON INTEGRATION を追加するだけで対応できます。​​​​​​​​​​​​​​​​
+
