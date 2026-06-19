@@ -236,6 +236,216 @@ GRANT ROLE fr_AI_POC_DEVELOPER TO USER DEV_AI_POC;
 
 ar_AI_USE のように Snowflake 提供の DR（CORTEX_USER 等）を AR で束ねるパターンと、自作 DR（dr_DEV_DB_READ）を AR で束ねるパターンの両方が共存する形になります。​​​​​​​​​​​​​​​​
 
+-----------
 
+## – ============================================================
+– AI POC 開発者ユーザー作成スクリプト
+– Snowflake CLI (snow) Jinja2 テンプレート版
+– ============================================================
+– 【呼び出し方】
+
+## –   snow sql -f create_ai_poc_developer.sql   
+–            -D db=DEV_DB   
+–            -D name=IKEDA   
+–            -D wh=DEV_WH
+
+## – 【パラメータ】
+–   db   : 対象データベース名
+–   name : ユーザー個人名（ロール名・ユーザー名に使用）
+–   wh   : 開発用ウェアハウス名
+
+## – 【作成されるオブジェクト】（例: db=DEV_DB, name=IKEDA）
+
+## –   Database Roles（<db> に紐づく）:
+–     dr_<db>*RAW_READ
+–     dr*<db>*TRANSFORM_READ
+–     dr*<db>*MART_READ
+–     dr*<db>*COMMON_READ
+–     dr*<db>*AUDIT_READ
+–     dr*<db>*WEB_READ
+–     dr*<db>_SANDBOX_READWRITE
+
+## –   Action Roles（個人名入り）:
+–     ar_<name>*AI_USE          … CORTEX_USER + COPILOT_USER + USE AI FUNCTIONS
+–     ar*<name>*AI_BUILD        … CREATE MODEL + CREATE CORTEX SEARCH SERVICE
+–     ar*<name>*DB_READ         … 参照スキーマ DR 6本を束ねる
+–     ar*<name>_SANDBOX_BUILD   … sandbox DR + WH USAGE
+
+## –   Functional Role:
+–     fr_<name>_AI_POC_DEVELOPER
+
+## –   User:
+–     DEV_AI_<name>
+
+– 【前提条件】
+–   - ACCOUNTADMIN ロールで実行すること
+–   - <wh> が存在すること
+–   - <db> に raw/transform/mart/common/audit/web/sandbox スキーマが存在すること
+– ============================================================
+
+USE ROLE ACCOUNTADMIN;
+
+– ============================================================
+– STEP 1: Database Roles の作成（参照スキーマ × 6）
+– ============================================================
+
+– [raw] 参照専用
+CREATE DATABASE ROLE IF NOT EXISTS {{ db }}.dr_{{ db }}*RAW_READ;
+GRANT USAGE  ON SCHEMA                   {{ db }}.raw TO DATABASE ROLE {{ db }}.dr*{{ db }}*RAW_READ;
+GRANT SELECT ON ALL TABLES    IN SCHEMA  {{ db }}.raw TO DATABASE ROLE {{ db }}.dr*{{ db }}*RAW_READ;
+GRANT SELECT ON ALL VIEWS     IN SCHEMA  {{ db }}.raw TO DATABASE ROLE {{ db }}.dr*{{ db }}*RAW_READ;
+GRANT SELECT ON FUTURE TABLES IN SCHEMA  {{ db }}.raw TO DATABASE ROLE {{ db }}.dr*{{ db }}*RAW_READ;
+GRANT SELECT ON FUTURE VIEWS  IN SCHEMA  {{ db }}.raw TO DATABASE ROLE {{ db }}.dr*{{ db }}_RAW_READ;
+
+– [transform] 参照専用
+CREATE DATABASE ROLE IF NOT EXISTS {{ db }}.dr_{{ db }}*TRANSFORM_READ;
+GRANT USAGE  ON SCHEMA                   {{ db }}.transform TO DATABASE ROLE {{ db }}.dr*{{ db }}*TRANSFORM_READ;
+GRANT SELECT ON ALL TABLES    IN SCHEMA  {{ db }}.transform TO DATABASE ROLE {{ db }}.dr*{{ db }}*TRANSFORM_READ;
+GRANT SELECT ON ALL VIEWS     IN SCHEMA  {{ db }}.transform TO DATABASE ROLE {{ db }}.dr*{{ db }}*TRANSFORM_READ;
+GRANT SELECT ON FUTURE TABLES IN SCHEMA  {{ db }}.transform TO DATABASE ROLE {{ db }}.dr*{{ db }}*TRANSFORM_READ;
+GRANT SELECT ON FUTURE VIEWS  IN SCHEMA  {{ db }}.transform TO DATABASE ROLE {{ db }}.dr*{{ db }}_TRANSFORM_READ;
+
+– [mart] 参照専用
+CREATE DATABASE ROLE IF NOT EXISTS {{ db }}.dr_{{ db }}*MART_READ;
+GRANT USAGE  ON SCHEMA                   {{ db }}.mart TO DATABASE ROLE {{ db }}.dr*{{ db }}*MART_READ;
+GRANT SELECT ON ALL TABLES    IN SCHEMA  {{ db }}.mart TO DATABASE ROLE {{ db }}.dr*{{ db }}*MART_READ;
+GRANT SELECT ON ALL VIEWS     IN SCHEMA  {{ db }}.mart TO DATABASE ROLE {{ db }}.dr*{{ db }}*MART_READ;
+GRANT SELECT ON FUTURE TABLES IN SCHEMA  {{ db }}.mart TO DATABASE ROLE {{ db }}.dr*{{ db }}*MART_READ;
+GRANT SELECT ON FUTURE VIEWS  IN SCHEMA  {{ db }}.mart TO DATABASE ROLE {{ db }}.dr*{{ db }}_MART_READ;
+
+– [common] 参照専用
+CREATE DATABASE ROLE IF NOT EXISTS {{ db }}.dr_{{ db }}*COMMON_READ;
+GRANT USAGE  ON SCHEMA                   {{ db }}.common TO DATABASE ROLE {{ db }}.dr*{{ db }}*COMMON_READ;
+GRANT SELECT ON ALL TABLES    IN SCHEMA  {{ db }}.common TO DATABASE ROLE {{ db }}.dr*{{ db }}*COMMON_READ;
+GRANT SELECT ON ALL VIEWS     IN SCHEMA  {{ db }}.common TO DATABASE ROLE {{ db }}.dr*{{ db }}*COMMON_READ;
+GRANT SELECT ON FUTURE TABLES IN SCHEMA  {{ db }}.common TO DATABASE ROLE {{ db }}.dr*{{ db }}*COMMON_READ;
+GRANT SELECT ON FUTURE VIEWS  IN SCHEMA  {{ db }}.common TO DATABASE ROLE {{ db }}.dr*{{ db }}_COMMON_READ;
+
+– [audit] 参照専用
+CREATE DATABASE ROLE IF NOT EXISTS {{ db }}.dr_{{ db }}*AUDIT_READ;
+GRANT USAGE  ON SCHEMA                   {{ db }}.audit TO DATABASE ROLE {{ db }}.dr*{{ db }}*AUDIT_READ;
+GRANT SELECT ON ALL TABLES    IN SCHEMA  {{ db }}.audit TO DATABASE ROLE {{ db }}.dr*{{ db }}*AUDIT_READ;
+GRANT SELECT ON ALL VIEWS     IN SCHEMA  {{ db }}.audit TO DATABASE ROLE {{ db }}.dr*{{ db }}*AUDIT_READ;
+GRANT SELECT ON FUTURE TABLES IN SCHEMA  {{ db }}.audit TO DATABASE ROLE {{ db }}.dr*{{ db }}*AUDIT_READ;
+GRANT SELECT ON FUTURE VIEWS  IN SCHEMA  {{ db }}.audit TO DATABASE ROLE {{ db }}.dr*{{ db }}_AUDIT_READ;
+
+– [web] 参照専用
+CREATE DATABASE ROLE IF NOT EXISTS {{ db }}.dr_{{ db }}*WEB_READ;
+GRANT USAGE  ON SCHEMA                   {{ db }}.web TO DATABASE ROLE {{ db }}.dr*{{ db }}*WEB_READ;
+GRANT SELECT ON ALL TABLES    IN SCHEMA  {{ db }}.web TO DATABASE ROLE {{ db }}.dr*{{ db }}*WEB_READ;
+GRANT SELECT ON ALL VIEWS     IN SCHEMA  {{ db }}.web TO DATABASE ROLE {{ db }}.dr*{{ db }}*WEB_READ;
+GRANT SELECT ON FUTURE TABLES IN SCHEMA  {{ db }}.web TO DATABASE ROLE {{ db }}.dr*{{ db }}*WEB_READ;
+GRANT SELECT ON FUTURE VIEWS  IN SCHEMA  {{ db }}.web TO DATABASE ROLE {{ db }}.dr*{{ db }}_WEB_READ;
+
+– ============================================================
+– STEP 2: Database Role の作成（sandbox：読み書き＋作成）
+– ============================================================
+
+CREATE DATABASE ROLE IF NOT EXISTS {{ db }}.dr_{{ db }}*SANDBOX_READWRITE;
+GRANT USAGE  ON SCHEMA {{ db }}.sandbox TO DATABASE ROLE {{ db }}.dr*{{ db }}*SANDBOX_READWRITE;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES    IN SCHEMA {{ db }}.sandbox TO DATABASE ROLE {{ db }}.dr*{{ db }}*SANDBOX_READWRITE;
+GRANT SELECT, INSERT, UPDATE, DELETE ON FUTURE TABLES IN SCHEMA {{ db }}.sandbox TO DATABASE ROLE {{ db }}.dr*{{ db }}*SANDBOX_READWRITE;
+GRANT CREATE TABLE     ON SCHEMA {{ db }}.sandbox TO DATABASE ROLE {{ db }}.dr*{{ db }}*SANDBOX_READWRITE;
+GRANT CREATE VIEW      ON SCHEMA {{ db }}.sandbox TO DATABASE ROLE {{ db }}.dr*{{ db }}*SANDBOX_READWRITE;
+GRANT CREATE PROCEDURE ON SCHEMA {{ db }}.sandbox TO DATABASE ROLE {{ db }}.dr*{{ db }}*SANDBOX_READWRITE;
+GRANT CREATE STAGE     ON SCHEMA {{ db }}.sandbox TO DATABASE ROLE {{ db }}.dr*{{ db }}_SANDBOX_READWRITE;
+
+– ============================================================
+– STEP 3: Action Roles の作成
+– ============================================================
+
+– [ar_<name>*AI_USE] AI機能実行系
+–   Snowflake提供 DR と Account Privilege を束ねる
+CREATE ROLE IF NOT EXISTS ar*{{ name }}*AI_USE;
+GRANT DATABASE ROLE SNOWFLAKE.CORTEX_USER  TO ROLE ar*{{ name }}*AI_USE;
+GRANT DATABASE ROLE SNOWFLAKE.COPILOT_USER TO ROLE ar*{{ name }}*AI_USE;
+GRANT PRIVILEGE USE AI FUNCTIONS           TO ROLE ar*{{ name }}_AI_USE;
+
+– [ar_<name>*AI_BUILD] AI オブジェクト構築系
+–   sandbox スキーマへの AI オブジェクト作成 + WH 使用権限
+CREATE ROLE IF NOT EXISTS ar*{{ name }}*AI_BUILD;
+GRANT CREATE MODEL                 ON SCHEMA {{ db }}.sandbox TO ROLE ar*{{ name }}*AI_BUILD;
+GRANT CREATE CORTEX SEARCH SERVICE ON SCHEMA {{ db }}.sandbox TO ROLE ar*{{ name }}*AI_BUILD;
+GRANT USAGE ON WAREHOUSE {{ wh }}                             TO ROLE ar*{{ name }}_AI_BUILD;
+
+– [ar_<name>*DB_READ] 参照スキーマへのアクセス
+–   DR 6本 + DB USAGE を束ねる
+CREATE ROLE IF NOT EXISTS ar*{{ name }}*DB_READ;
+GRANT USAGE          ON DATABASE {{ db }}                              TO ROLE ar*{{ name }}*DB_READ;
+GRANT DATABASE ROLE  {{ db }}.dr*{{ db }}*RAW_READ                    TO ROLE ar*{{ name }}*DB_READ;
+GRANT DATABASE ROLE  {{ db }}.dr*{{ db }}*TRANSFORM_READ              TO ROLE ar*{{ name }}*DB_READ;
+GRANT DATABASE ROLE  {{ db }}.dr*{{ db }}*MART_READ                   TO ROLE ar*{{ name }}*DB_READ;
+GRANT DATABASE ROLE  {{ db }}.dr*{{ db }}*COMMON_READ                 TO ROLE ar*{{ name }}*DB_READ;
+GRANT DATABASE ROLE  {{ db }}.dr*{{ db }}*AUDIT_READ                  TO ROLE ar*{{ name }}*DB_READ;
+GRANT DATABASE ROLE  {{ db }}.dr*{{ db }}*WEB_READ                    TO ROLE ar*{{ name }}_DB_READ;
+
+– [ar_<name>*SANDBOX_BUILD] sandbox 読み書き＋作成
+–   DR 1本 + DB USAGE + WH を束ねる
+CREATE ROLE IF NOT EXISTS ar*{{ name }}*SANDBOX_BUILD;
+GRANT USAGE         ON DATABASE {{ db }}                               TO ROLE ar*{{ name }}*SANDBOX_BUILD;
+GRANT DATABASE ROLE {{ db }}.dr*{{ db }}*SANDBOX_READWRITE            TO ROLE ar*{{ name }}*SANDBOX_BUILD;
+GRANT USAGE ON WAREHOUSE {{ wh }}                                      TO ROLE ar*{{ name }}_SANDBOX_BUILD;
+
+– ============================================================
+– STEP 4: Functional Role の作成
+– ============================================================
+
+CREATE ROLE IF NOT EXISTS fr_{{ name }}*AI_POC_DEVELOPER;
+GRANT ROLE ar*{{ name }}*AI_USE        TO ROLE fr*{{ name }}*AI_POC_DEVELOPER;
+GRANT ROLE ar*{{ name }}*AI_BUILD      TO ROLE fr*{{ name }}*AI_POC_DEVELOPER;
+GRANT ROLE ar*{{ name }}*DB_READ       TO ROLE fr*{{ name }}*AI_POC_DEVELOPER;
+GRANT ROLE ar*{{ name }}*SANDBOX_BUILD TO ROLE fr*{{ name }}_AI_POC_DEVELOPER;
+
+– ACCOUNTADMIN への付与（管理用）
+GRANT ROLE fr_{{ name }}_AI_POC_DEVELOPER TO ROLE ACCOUNTADMIN;
+
+– ============================================================
+– STEP 5: ユーザーの作成
+– ============================================================
+
+CREATE USER IF NOT EXISTS DEV_AI_{{ name }}
+TYPE                 = PERSON
+DEFAULT_ROLE         = fr_{{ name }}_AI_POC_DEVELOPER
+DEFAULT_WAREHOUSE    = {{ wh }}
+DEFAULT_NAMESPACE    = {{ db }}.sandbox
+MUST_CHANGE_PASSWORD = TRUE
+COMMENT              = ‘AI POC 開発者アカウント’;
+
+GRANT ROLE fr_{{ name }}*AI_POC_DEVELOPER TO USER DEV_AI*{{ name }};
+
+– ============================================================
+– STEP 6: 作成結果の確認
+– ============================================================
+
+SHOW GRANTS TO ROLE fr_{{ name }}*AI_POC_DEVELOPER;
+SHOW GRANTS TO USER DEV_AI*{{ name }};
+
+## – ============================================================
+– 【クリーンアップ手順】PoC 終了時はこちらを実行
+
+## –   snow sql -f create_ai_poc_developer.sql   
+–            -D db=DEV_DB   
+–            -D name=IKEDA   
+–            -D wh=DEV_WH   
+–            –define cleanup=true
+
+## –   ※ 以下を別ファイル cleanup_ai_poc_developer.sql として保存し
+–      同じ -D オプションで呼び出してもよい
+
+–   DROP USER  IF EXISTS DEV_AI_{{ name }};
+–   DROP ROLE  IF EXISTS fr_{{ name }}*AI_POC_DEVELOPER;
+–   DROP ROLE  IF EXISTS ar*{{ name }}*AI_USE;
+–   DROP ROLE  IF EXISTS ar*{{ name }}*AI_BUILD;
+–   DROP ROLE  IF EXISTS ar*{{ name }}*DB_READ;
+–   DROP ROLE  IF EXISTS ar*{{ name }}*SANDBOX_BUILD;
+–   – DR は他ユーザーと共用のため、全員削除後にまとめて実行
+–   – DROP DATABASE ROLE IF EXISTS {{ db }}.dr*{{ db }}*RAW_READ;
+–   – DROP DATABASE ROLE IF EXISTS {{ db }}.dr*{{ db }}*TRANSFORM_READ;
+–   – DROP DATABASE ROLE IF EXISTS {{ db }}.dr*{{ db }}*MART_READ;
+–   – DROP DATABASE ROLE IF EXISTS {{ db }}.dr*{{ db }}*COMMON_READ;
+–   – DROP DATABASE ROLE IF EXISTS {{ db }}.dr*{{ db }}*AUDIT_READ;
+–   – DROP DATABASE ROLE IF EXISTS {{ db }}.dr*{{ db }}*WEB_READ;
+–   – DROP DATABASE ROLE IF EXISTS {{ db }}.dr*{{ db }}_SANDBOX_READWRITE;
+– ============================================================
 
 
