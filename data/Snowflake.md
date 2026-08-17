@@ -1,6 +1,120 @@
 # Snowflake
 
+SQLスクリプティング（DECLARE/CURSOR/FOR）は逐次実行なので、スレッド数を指定した並列化はできません。並列にしたい場合は**Pythonストアドプロシージャ（Snowpark）**か**クライアント側のPythonスクリプト**で、複数コネクション/カーソルを使う必要があります。クライアント側の方が制御しやすいのでそちらを書きます。
 
+**① ダンプ（指定スレッド数で並列アンロード）**
+
+```python
+import snowflake.connector
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+CONN_PARAMS = dict(
+    account='<your_account>',
+    user='<your_user>',
+    password='<your_password>',  # または key-pair認証に変更
+    warehouse='<your_warehouse>',
+    role='<your_role>',
+)
+
+def dump_table(src_db, stage_name, snapshot_label, schema, table):
+    conn = snowflake.connector.connect(**CONN_PARAMS)
+    try:
+        cs = conn.cursor()
+        stmt = f"""
+            COPY INTO @{stage_name}/{snapshot_label}/{schema}/{table}_
+            FROM {src_db}.{schema}.{table}
+            FILE_FORMAT = (TYPE = PARQUET)
+            OVERWRITE = TRUE
+            HEADER = TRUE
+        """
+        cs.execute(stmt)
+        return f"OK: {schema}.{table}"
+    except Exception as e:
+        return f"NG: {schema}.{table} -> {e}"
+    finally:
+        conn.close()
+
+def dump_all_tables(src_db, stage_name, snapshot_label, thread_count=8):
+    conn = snowflake.connector.connect(**CONN_PARAMS)
+    cs = conn.cursor()
+    cs.execute(f"""
+        SELECT table_schema, table_name
+        FROM {src_db}.INFORMATION_SCHEMA.TABLES
+        WHERE table_type = 'BASE TABLE'
+          AND table_schema != 'INFORMATION_SCHEMA'
+    """)
+    tables = cs.fetchall()
+    conn.close()
+
+    results = []
+    with ThreadPoolExecutor(max_workers=thread_count) as executor:
+        futures = {
+            executor.submit(dump_table, src_db, stage_name, snapshot_label, schema, table): (schema, table)
+            for schema, table in tables
+        }
+        for future in as_completed(futures):
+            results.append(future.result())
+            print(results[-1])
+    return results
+
+# 実行例（スレッド数10で並列ダンプ）
+dump_all_tables('PROD_DB', 'MY_STAGE', 'snapshots/20260816', thread_count=10)
+```
+
+**② ロード（指定スレッド数で並列ロード、構造は変更しない）**
+
+```python
+def load_table(target_db, stage_name, snapshot_label, schema, table):
+    conn = snowflake.connector.connect(**CONN_PARAMS)
+    try:
+        cs = conn.cursor()
+        cs.execute(f"TRUNCATE TABLE {target_db}.{schema}.{table}")
+        stmt = f"""
+            COPY INTO {target_db}.{schema}.{table}
+            FROM @{stage_name}/{snapshot_label}/{schema}/{table}_
+            FILE_FORMAT = (TYPE = PARQUET)
+            MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
+        """
+        cs.execute(stmt)
+        return f"OK: {schema}.{table}"
+    except Exception as e:
+        return f"NG: {schema}.{table} -> {e}"
+    finally:
+        conn.close()
+
+def load_all_tables(target_db, stage_name, snapshot_label, thread_count=8):
+    conn = snowflake.connector.connect(**CONN_PARAMS)
+    cs = conn.cursor()
+    cs.execute(f"""
+        SELECT table_schema, table_name
+        FROM {target_db}.INFORMATION_SCHEMA.TABLES
+        WHERE table_type = 'BASE TABLE'
+          AND table_schema != 'INFORMATION_SCHEMA'
+    """)
+    tables = cs.fetchall()
+    conn.close()
+
+    results = []
+    with ThreadPoolExecutor(max_workers=thread_count) as executor:
+        futures = {
+            executor.submit(load_table, target_db, stage_name, snapshot_label, schema, table): (schema, table)
+            for schema, table in tables
+        }
+        for future in as_completed(futures):
+            results.append(future.result())
+            print(results[-1])
+    return results
+
+# 実行例
+load_all_tables('TEST_DB', 'MY_STAGE', 'snapshots/20260816', thread_count=10)
+```
+
+**注意点**
+
+- `thread_count`はコネクションを都度張り直す実装なので、あまり大きくしすぎるとWarehouse側のクエリキューが詰まります。まずは5〜10あたりから試すのが無難です。
+- Warehouseサイズが小さいと、並列度を上げてもクエリキューイングで頭打ちになります。テーブル数・データ量が多い場合はWarehouseサイズも合わせて調整してください。
+- 接続情報（パスワード）は環境変数や`~/.snowflake/config`、key-pair認証に置き換えることを推奨します（シナネン案件で使っているkey-pair認証方式と揃えても良いと思います）。
+- Snowflake内部で完結させたい場合は、Snowparkの`Session`をPythonストアドプロシージャ内で使う方法もありますが、ストアドプロシージャ内は基本シングルスレッド実行の制約が強いため、この用途ならクライアント側スクリプトの方が素直です。
 ----------
 '''bash
 
