@@ -1,6 +1,111 @@
 # Snowflake
 
 
+----------
+import snowflake.connector
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+CONN_PARAMS = dict(
+    account='<your_account>',
+    user='<your_user>',
+    password='<your_password>',  # または key-pair認証に変更
+    warehouse='<your_warehouse>',
+    role='<your_role>',
+)
+
+def dump_table(src_db, stage_name, snapshot_label, schema, table):
+    conn = snowflake.connector.connect(**CONN_PARAMS)
+    try:
+        cs = conn.cursor()
+        stmt = f"""
+            COPY INTO @{stage_name}/{snapshot_label}/{schema}/{table}_
+            FROM {src_db}.{schema}.{table}
+            FILE_FORMAT = (TYPE = PARQUET)
+            OVERWRITE = TRUE
+            HEADER = TRUE
+        """
+        cs.execute(stmt)
+        return f"OK: {schema}.{table}"
+    except Exception as e:
+        return f"NG: {schema}.{table} -> {e}"
+    finally:
+        conn.close()
+
+def dump_all_tables(src_db, stage_name, snapshot_label, thread_count=8):
+    conn = snowflake.connector.connect(**CONN_PARAMS)
+    cs = conn.cursor()
+    cs.execute(f"""
+        SELECT table_schema, table_name
+        FROM {src_db}.INFORMATION_SCHEMA.TABLES
+        WHERE table_type = 'BASE TABLE'
+          AND table_schema != 'INFORMATION_SCHEMA'
+    """)
+    tables = cs.fetchall()
+    conn.close()
+
+    results = []
+    with ThreadPoolExecutor(max_workers=thread_count) as executor:
+        futures = {
+            executor.submit(dump_table, src_db, stage_name, snapshot_label, schema, table): (schema, table)
+            for schema, table in tables
+        }
+        for future in as_completed(futures):
+            results.append(future.result())
+            print(results[-1])
+    return results
+
+# 実行例（スレッド数10で並列ダンプ）
+dump_all_tables('PROD_DB', 'MY_STAGE', 'snapshots/20260816', thread_count=10)
+
+
+----------
+def load_table(target_db, stage_name, snapshot_label, schema, table):
+    conn = snowflake.connector.connect(**CONN_PARAMS)
+    try:
+        cs = conn.cursor()
+        cs.execute(f"TRUNCATE TABLE {target_db}.{schema}.{table}")
+        stmt = f"""
+            COPY INTO {target_db}.{schema}.{table}
+            FROM @{stage_name}/{snapshot_label}/{schema}/{table}_
+            FILE_FORMAT = (TYPE = PARQUET)
+            MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
+        """
+        cs.execute(stmt)
+        return f"OK: {schema}.{table}"
+    except Exception as e:
+        return f"NG: {schema}.{table} -> {e}"
+    finally:
+        conn.close()
+
+def load_all_tables(target_db, stage_name, snapshot_label, thread_count=8):
+    conn = snowflake.connector.connect(**CONN_PARAMS)
+    cs = conn.cursor()
+    cs.execute(f"""
+        SELECT table_schema, table_name
+        FROM {target_db}.INFORMATION_SCHEMA.TABLES
+        WHERE table_type = 'BASE TABLE'
+          AND table_schema != 'INFORMATION_SCHEMA'
+    """)
+    tables = cs.fetchall()
+    conn.close()
+
+    results = []
+    with ThreadPoolExecutor(max_workers=thread_count) as executor:
+        futures = {
+            executor.submit(load_table, target_db, stage_name, snapshot_label, schema, table): (schema, table)
+            for schema, table in tables
+        }
+        for future in as_completed(futures):
+            results.append(future.result())
+            print(results[-1])
+    return results
+
+# 実行例
+load_all_tables('TEST_DB', 'MY_STAGE', 'snapshots/20260816', thread_count=10)
+
+--------
+
+
 # dbt Core × dbt Projects on Snowflake 開発環境構築ガイド
 
 対象読者: 新人エンジニア
