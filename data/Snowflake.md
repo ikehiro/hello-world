@@ -2,6 +2,7 @@
 
 
 ----------
+'''
 import snowflake.connector
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -53,7 +54,7 @@ def dump_all_tables(src_db, stage_name, snapshot_label, thread_count=8):
             results.append(future.result())
             print(results[-1])
     return results
-
+'''
 # 実行例（スレッド数10で並列ダンプ）
 dump_all_tables('PROD_DB', 'MY_STAGE', 'snapshots/20260816', thread_count=10)
 
