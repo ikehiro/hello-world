@@ -1,5 +1,58 @@
 # Snowflake
 
+
+アカウントレベルでMFAを強制しつつ、特定ユーザーだけ除外する方法です。ユーザーレベルの認証ポリシーはアカウントレベルより優先されるため、除外したいユーザーに「MFA任意」のポリシーを個別適用すれば実現できます。
+
+## 手順
+
+**1. アカウント全体用のポリシー(MFA必須)を作成・適用**
+
+```sql
+CREATE AUTHENTICATION POLICY require_mfa_policy
+  AUTHENTICATION_METHODS = ('PASSWORD')
+  MFA_ENROLLMENT = 'REQUIRED';
+
+ALTER ACCOUNT SET AUTHENTICATION POLICY require_mfa_policy;
+```
+
+**2. 除外用ポリシー(MFA任意)を別途作成**
+
+```sql
+CREATE AUTHENTICATION POLICY optional_mfa_policy
+  AUTHENTICATION_METHODS = ('PASSWORD')
+  MFA_ENROLLMENT = 'OPTIONAL';
+```
+
+**3. 除外したいユーザーにだけ個別適用**
+
+```sql
+ALTER USER 除外したいユーザー名 SET AUTHENTICATION POLICY optional_mfa_policy;
+```
+
+## ポリシーの優先順位
+
+Snowflakeの認証ポリシーはスコープの狭い方が優先されます。
+
+```
+ユーザーレベル > アカウントレベル
+```
+
+なので、このユーザーだけはアカウント全体のポリシーを無視して`optional_mfa_policy`(MFA任意)が適用されます。
+
+## 除外を元に戻したいとき
+
+```sql
+ALTER USER 対象ユーザー名 UNSET AUTHENTICATION POLICY;
+```
+
+これでユーザー個別のポリシーが解除され、アカウントレベルのポリシー(MFA必須)に戻ります。
+
+## 運用上の注意
+
+- 除外は「サービスアカウント的に使っている人間ユーザー」や「移行期間中の暫定対応」など、理由を明確にして最小限にとどめるのが望ましいです。恒久的にMFAを回避する人間ユーザーが多いと、セキュリティ監査(Trust Center等)で指摘対象になりやすいです
+- 除外の棚卸しがしやすいよう、除外用ポリシー名にコメントを付けたり、適用ユーザー一覧を`SHOW USERS`やドキュメントで管理しておくと後々楽です
+
+
 SQLスクリプティング（DECLARE/CURSOR/FOR）は逐次実行なので、スレッド数を指定した並列化はできません。並列にしたい場合は**Pythonストアドプロシージャ（Snowpark）**か**クライアント側のPythonスクリプト**で、複数コネクション/カーソルを使う必要があります。クライアント側の方が制御しやすいのでそちらを書きます。
 
 **① ダンプ（指定スレッド数で並列アンロード）**
