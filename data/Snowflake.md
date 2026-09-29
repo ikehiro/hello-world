@@ -52,6 +52,26 @@ ALTER USER 対象ユーザー名 UNSET AUTHENTICATION POLICY;
 - 除外は「サービスアカウント的に使っている人間ユーザー」や「移行期間中の暫定対応」など、理由を明確にして最小限にとどめるのが望ましいです。恒久的にMFAを回避する人間ユーザーが多いと、セキュリティ監査(Trust Center等)で指摘対象になりやすいです
 - 除外の棚卸しがしやすいよう、除外用ポリシー名にコメントを付けたり、適用ユーザー一覧を`SHOW USERS`やドキュメントで管理しておくと後々楽です
 
+`AUTHENTICATION_METHODS`パラメータに指定できる値は以下の通りです(複数指定可)。
+
+| 値 | 内容 |
+|---|---|
+| **ALL** | すべての認証方法を許可(デフォルト) |
+| **PASSWORD** | ユーザー名+パスワードでの認証 |
+| **SAML** | SAML2セキュリティ統合(SSO) |
+| **OIDC** | OIDCセキュリティ統合(SSO) |
+| **OAUTH** | External OAuth |
+| **KEYPAIR** | キーペア認証 |
+| **PROGRAMMATIC_ACCESS_TOKEN** | プログラマティックアクセストークン(PAT)による認証 |
+| **WORKLOAD_IDENTITY** | ワークロードIDフェデレーションによる認証 |
+
+## 補足
+
+- サービスユーザー(ETL/BIツール等の接続用)にMFA必須ポリシーを誤って適用しないためには、`AUTHENTICATION_METHODS = ('PASSWORD')`のように**パスワード認証だけを対象**にポリシーを絞り込むのが安全です。`KEYPAIR`や`OAUTH`、`PROGRAMMATIC_ACCESS_TOKEN`はMFAの対象外の認証方式なので、これらを使うサービスユーザーは自然と対象外になります
+- `SECURITY_INTEGRATIONS`パラメータと組み合わせる場合、`AUTHENTICATION_METHODS`に`SAML`または`OIDC`が含まれていないと効果がありません。また`SECURITY_INTEGRATIONS`に指定する統合の種類(SAML統合かOAuth統合か)は、`AUTHENTICATION_METHODS`の指定と矛盾しないようにする必要があります(例:`SECURITY_INTEGRATIONS`にSAML統合を入れているのに`AUTHENTICATION_METHODS`が`OAUTH`だけだとポリシー作成不可)
+
+---------
+---------
 
 SQLスクリプティング（DECLARE/CURSOR/FOR）は逐次実行なので、スレッド数を指定した並列化はできません。並列にしたい場合は**Pythonストアドプロシージャ（Snowpark）**か**クライアント側のPythonスクリプト**で、複数コネクション/カーソルを使う必要があります。クライアント側の方が制御しやすいのでそちらを書きます。
 
